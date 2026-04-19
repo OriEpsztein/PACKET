@@ -57,6 +57,7 @@ def packet_loss_hourly_sensor_matrix(
     file_buffer,
     freq_minutes: int = 3,
     keep_full_hours_only: bool = True,
+    last_hour_only: bool = False
 ) -> dict:
     if hasattr(file_buffer, 'seek'):
         file_buffer.seek(0)
@@ -67,6 +68,13 @@ def packet_loss_hourly_sensor_matrix(
 
     if wide.empty:
         raise ValueError("No usable numeric sensor columns found after parsing.")
+
+    # Apply Last Hour filter if checked
+    if last_hour_only:
+        max_ts = wide.index.max()
+        wide = wide[wide.index >= (max_ts - pd.Timedelta(hours=1))]
+        if wide.empty:
+            raise ValueError("No data found in the last 60 minutes.")
 
     sensors = list(wide.columns)
     n_total = len(sensors)
@@ -88,7 +96,7 @@ def packet_loss_hourly_sensor_matrix(
 
     wide_use = wide_full.loc[hour_idx.isin(hours_used)]
     if wide_use.empty:
-        raise ValueError("No hours left after filtering. Try keep_full_hours_only=False.")
+        raise ValueError("No hours left after filtering. Try unchecking 'Show full hours only'.")
 
     present = wide_use.notna()
     received_hour_sensor = present.groupby(wide_use.index.floor("h")).sum()
@@ -147,11 +155,12 @@ def make_overall_with_points_toggle(
     file_buffer,
     freq_minutes: int = 3,
     keep_full_hours_only: bool = True,
+    last_hour_only: bool = False,
     tick_every_hours: int = 4,
     orange_rgba: str = "rgba(255,140,0,0.18)",
     bin_size: float = 0.5,
 ):
-    rep = packet_loss_hourly_sensor_matrix(file_buffer, freq_minutes, keep_full_hours_only)
+    rep = packet_loss_hourly_sensor_matrix(file_buffer, freq_minutes, keep_full_hours_only, last_hour_only)
 
     hourly = rep["hourly_overall"].copy()
     loss_mat = rep["hourly_sensor_loss"]
@@ -251,7 +260,14 @@ def make_overall_with_points_toggle(
 
     return fig
 
-def sensor_overall_packet_loss(file_buffer, freq_minutes: int = 3, keep_full_hours_only: bool = True) -> pd.DataFrame:
+
+def sensor_overall_packet_loss(
+    file_buffer, 
+    freq_minutes: int = 3, 
+    keep_full_hours_only: bool = True,
+    last_hour_only: bool = False
+) -> pd.DataFrame:
+    
     if hasattr(file_buffer, 'seek'):
         file_buffer.seek(0)
     raw = pd.read_csv(file_buffer)
@@ -260,6 +276,10 @@ def sensor_overall_packet_loss(file_buffer, freq_minutes: int = 3, keep_full_hou
 
     if wide.empty:
         raise ValueError("No usable numeric sensor columns found after parsing.")
+
+    if last_hour_only:
+        max_ts = wide.index.max()
+        wide = wide[wide.index >= (max_ts - pd.Timedelta(hours=1))]
 
     sensors = list(wide.columns)
     expected_per_hour = int(round(60 / freq_minutes))
@@ -305,8 +325,16 @@ def sensor_overall_packet_loss(file_buffer, freq_minutes: int = 3, keep_full_hou
 
     return out.sort_values("loss_pct")
 
-def plot_sensor_loss_distribution(file_buffer, freq_minutes: int = 3, keep_full_hours_only: bool = True, bin_size: float = 0.5) -> go.Figure:
-    df_s = sensor_overall_packet_loss(file_buffer, freq_minutes, keep_full_hours_only)
+
+def plot_sensor_loss_distribution(
+    file_buffer, 
+    freq_minutes: int = 3, 
+    keep_full_hours_only: bool = True, 
+    last_hour_only: bool = False,
+    bin_size: float = 0.5
+) -> go.Figure:
+    
+    df_s = sensor_overall_packet_loss(file_buffer, freq_minutes, keep_full_hours_only, last_hour_only)
 
     fig = go.Figure()
     fig.add_trace(go.Histogram(
@@ -329,42 +357,58 @@ st.set_page_config(page_title="Field 4D - Packet Loss Analyzer", layout="wide")
 st.title("Field 4D: Packet Loss Analysis")
 
 st.sidebar.header("Data Settings")
-keep_full = st.sidebar.checkbox("Show full hours only", value=True)
 
-# Frequency is hardcoded to 3 as requested
+# Checkboxes with help tooltip ('?' icon)
+keep_full = st.sidebar.checkbox(
+    "Show full hours only", 
+    value=True, 
+    help="Ignores partial hours at the start or end of your dataset to ensure percentage math is perfectly based on exactly 60 minutes of expected data."
+)
+
+last_hour = st.sidebar.checkbox(
+    "Analyze last 60 minutes only", 
+    value=False, 
+    help="Filters the entire CSV to only calculate and display the most recent 60 minutes of data."
+)
+
 FREQ_MINUTES = 3 
 
 uploaded_file = st.file_uploader("Upload Sensor Data File (CSV)", type=["csv"])
 
 if uploaded_file is not None:
     try:
-        # Check active sensors based on a 15-minute window
+        # Extract and display first/last timestamps
         df_raw = pd.read_csv(uploaded_file)
         ts_col = _detect_timestamp_column(df_raw)
         df_raw[ts_col] = pd.to_datetime(df_raw[ts_col])
         
-        latest_time = df_raw[ts_col].max()
-        active_cutoff = latest_time - pd.Timedelta(minutes=15)
-        
-        wide_df = _to_wide_timeseries(df_raw, ts_col)
-        last_seen = wide_df.apply(lambda x: x.last_valid_index())
-        active_sensors = last_seen[last_seen >= active_cutoff].dropna().index.tolist()
-        total_sensors = len(wide_df.columns)
+        first_time = df_raw[ts_col].min()
+        last_time = df_raw[ts_col].max()
         
         st.sidebar.markdown("---")
-        st.sidebar.metric("Sensor Status (Active / Total)", f"{len(active_sensors)} / {total_sensors}", 
-                          help="A sensor is considered active if it transmitted within the last 15 minutes.")
-        st.sidebar.text(f"Last Sample: {latest_time.strftime('%Y-%m-%d %H:%M')}")
+        st.sidebar.markdown("**Dataset Range:**")
+        st.sidebar.text(f"Start: {first_time.strftime('%Y-%m-%d %H:%M')}")
+        st.sidebar.text(f"End:   {last_time.strftime('%Y-%m-%d %H:%M')}")
 
         st.success("File loaded and analyzed successfully!")
 
-        # Create plots using the hardcoded frequency
-        fig_overall = make_overall_with_points_toggle(uploaded_file, freq_minutes=FREQ_MINUTES, keep_full_hours_only=keep_full)
+        # Create plots
+        fig_overall = make_overall_with_points_toggle(
+            uploaded_file, 
+            freq_minutes=FREQ_MINUTES, 
+            keep_full_hours_only=keep_full,
+            last_hour_only=last_hour
+        )
         st.plotly_chart(fig_overall, use_container_width=True)
         
         st.markdown("---")
         
-        fig_dist = plot_sensor_loss_distribution(uploaded_file, freq_minutes=FREQ_MINUTES, keep_full_hours_only=keep_full)
+        fig_dist = plot_sensor_loss_distribution(
+            uploaded_file, 
+            freq_minutes=FREQ_MINUTES, 
+            keep_full_hours_only=keep_full,
+            last_hour_only=last_hour
+        )
         st.plotly_chart(fig_dist, use_container_width=True)
 
     except Exception as e:
