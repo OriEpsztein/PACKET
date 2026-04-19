@@ -226,7 +226,8 @@ def make_overall_with_points_toggle(
     vis_overall = [True,  False, False]
     vis_points  = [False, True,  True ]
 
-    tick0 = pd.to_datetime(hours_index.min()).floor("D")
+    tick0 = pd.to_datetime(hours_index.min()).floor("d")
+    
     fig.update_layout(
         template="plotly_white",
         title="Overall Packet Loss (%) by Hour",
@@ -242,7 +243,7 @@ def make_overall_with_points_toggle(
         yaxis=dict(range=[0, 100], autorange=True),
     )
 
-    tick_vals = pd.date_range(start=tick0, end=pd.to_datetime(hours_index.max()).ceil("H"), freq=f"{tick_every_hours}H")
+    tick_vals = pd.date_range(start=tick0, end=pd.to_datetime(hours_index.max()).ceil("h"), freq=f"{tick_every_hours}h")
     tick_text = [f"{t:%H:%M}<br>{t:%Y-%m-%d}" if t.hour == 0 else f"{t:%H:%M}<br>" for t in tick_vals]
 
     fig.update_xaxes(type="date", tickmode="array", tickvals=tick_vals, ticktext=tick_text, tickangle=0, automargin=True)
@@ -328,8 +329,10 @@ st.set_page_config(page_title="Field 4D - Packet Loss Analyzer", layout="wide")
 st.title("Field 4D: Packet Loss Analysis")
 
 st.sidebar.header("Data Settings")
-freq = st.sidebar.number_input("Expected Transmission Frequency (minutes)", min_value=1, max_value=60, value=3)
 keep_full = st.sidebar.checkbox("Show full hours only", value=True)
+
+# Frequency is hardcoded to 3 as requested
+FREQ_MINUTES = 3 
 
 uploaded_file = st.file_uploader("Upload Sensor Data File (CSV)", type=["csv"])
 
@@ -355,13 +358,13 @@ if uploaded_file is not None:
 
         st.success("File loaded and analyzed successfully!")
 
-        # Create plots
-        fig_overall = make_overall_with_points_toggle(uploaded_file, freq_minutes=freq, keep_full_hours_only=keep_full)
+        # Create plots using the hardcoded frequency
+        fig_overall = make_overall_with_points_toggle(uploaded_file, freq_minutes=FREQ_MINUTES, keep_full_hours_only=keep_full)
         st.plotly_chart(fig_overall, use_container_width=True)
         
         st.markdown("---")
         
-        fig_dist = plot_sensor_loss_distribution(uploaded_file, freq_minutes=freq, keep_full_hours_only=keep_full)
+        fig_dist = plot_sensor_loss_distribution(uploaded_file, freq_minutes=FREQ_MINUTES, keep_full_hours_only=keep_full)
         st.plotly_chart(fig_dist, use_container_width=True)
 
     except Exception as e:
