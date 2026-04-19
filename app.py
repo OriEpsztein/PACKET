@@ -147,6 +147,8 @@ def plot_hourly_loss(
     rep: dict,
     view_mode: str,
     selected_sensors: list = None,
+    show_raw_points: bool = True,
+    show_overall_line: bool = False,
     tick_every_hours: int = 4,
     bin_size: float = 0.5
 ):
@@ -160,7 +162,8 @@ def plot_hourly_loss(
 
     fig = go.Figure()
 
-    if view_mode == "Overall Average":
+    # Helper function to consistently draw the overall line
+    def draw_overall_line(marker_size=6):
         y_overall = hourly["loss_pct"].to_numpy(dtype=float)
         custom_line = np.stack([
             hourly["packets_received"].to_numpy(),
@@ -172,8 +175,8 @@ def plot_hourly_loss(
         ], axis=1)
 
         fig.add_trace(go.Scatter(
-            x=hours, y=y_overall, mode="lines+markers", name="Overall loss",
-            line=dict(color="royalblue", width=2), marker=dict(size=6, color="royalblue"),
+            x=hours, y=y_overall, mode="lines+markers", name="Overall Average",
+            line=dict(color="royalblue", width=2), marker=dict(size=marker_size, color="royalblue"),
             customdata=custom_line,
             hovertemplate=(
                 "Hour=%{x|%Y-%m-%d %H:%M}<br>Packet Loss (%)=%{y:.2f}<br>"
@@ -183,32 +186,40 @@ def plot_hourly_loss(
             )
         ))
 
+    if view_mode == "Overall Average":
+        draw_overall_line(marker_size=6)
+
     elif view_mode == "Raw Points":
-        rows = []
-        for h in hours_index:
-            row = loss_mat.loc[h].dropna()
-            for v in row.values:
-                v = float(np.clip(v, 0, 100))
-                loss_bin = float(np.round(v / bin_size) * bin_size)
-                rows.append((h, v, loss_bin))
+        if show_raw_points:
+            rows = []
+            for h in hours_index:
+                row = loss_mat.loc[h].dropna()
+                for v in row.values:
+                    v = float(np.clip(v, 0, 100))
+                    loss_bin = float(np.round(v / bin_size) * bin_size)
+                    rows.append((h, v, loss_bin))
 
-        dfp = pd.DataFrame(rows, columns=["hour", "loss", "loss_bin"])
-        dfp["bin_count"] = dfp.groupby(["hour", "loss_bin"])["loss_bin"].transform("size")
+            dfp = pd.DataFrame(rows, columns=["hour", "loss", "loss_bin"])
+            dfp["bin_count"] = dfp.groupby(["hour", "loss_bin"])["loss_bin"].transform("size")
 
-        xs = dfp["hour"].to_numpy()
-        ys = dfp["loss"].to_numpy(dtype=float)
+            xs = dfp["hour"].to_numpy()
+            ys = dfp["loss"].to_numpy(dtype=float)
 
-        cd = np.stack([
-            dfp["bin_count"].to_numpy(),
-            np.full(len(dfp), n_total),
-            dfp["loss_bin"].to_numpy(dtype=float),
-        ], axis=1)
+            cd = np.stack([
+                dfp["bin_count"].to_numpy(),
+                np.full(len(dfp), n_total),
+                dfp["loss_bin"].to_numpy(dtype=float),
+            ], axis=1)
 
-        fig.add_trace(go.Scattergl(
-            x=xs, y=ys, mode="markers", name="Sensors (raw points)",
-            marker=dict(size=7, color="rgba(255,140,0,0.5)"), customdata=cd,
-            hovertemplate="Hour=%{x|%Y-%m-%d %H:%M}<br>Packet Loss (%)=%{y:.2f}<br>Sensors=%{customdata[0]} / %{customdata[1]}<extra></extra>"
-        ))
+            fig.add_trace(go.Scattergl(
+                x=xs, y=ys, mode="markers", name="Sensors (raw points)",
+                marker=dict(size=7, color="rgba(255,140,0,0.5)"), customdata=cd,
+                hovertemplate="Hour=%{x|%Y-%m-%d %H:%M}<br>Packet Loss (%)=%{y:.2f}<br>Sensors=%{customdata[0]} / %{customdata[1]}<extra></extra>"
+            ))
+            
+        if show_overall_line:
+            # Draw slightly larger markers to stand out from the raw points
+            draw_overall_line(marker_size=10)
 
     elif view_mode == "Specific Sensors" and selected_sensors:
         for sensor in selected_sensors:
@@ -318,7 +329,7 @@ st.title("Field 4D: Packet Loss Analysis")
 
 st.sidebar.header("Data Settings")
 
-# Checkboxes with help tooltip ('?' icon)
+# Checkbox with help tooltip ('?' icon)
 keep_full = st.sidebar.checkbox(
     "Show full hours only", 
     value=True, 
@@ -363,16 +374,32 @@ if uploaded_file is not None:
             horizontal=True
         )
         
-        # 3. Dynamic Sensor Selection (Only shows if "Specific Sensors" is checked)
+        # 3. Dynamic Sub-settings based on chosen view
         selected_sensors = []
+        show_raw = True
+        show_overall = False
+        
         if view_mode == "Specific Sensors":
             sensor_list = rep["hourly_sensor_loss"].columns.tolist()
             # Select the first two sensors by default so the chart isn't empty
             default_selection = sensor_list[:2] if len(sensor_list) >= 2 else sensor_list
             selected_sensors = st.multiselect("Select sensors to display:", sensor_list, default=default_selection)
+            
+        elif view_mode == "Raw Points":
+            col1, col2 = st.columns(2)
+            with col1:
+                show_raw = st.checkbox("Show Raw Sensor Points", value=True)
+            with col2:
+                show_overall = st.checkbox("Overlay Overall Average Line", value=True)
 
         # 4. Render Main Plot
-        fig_overall = plot_hourly_loss(rep, view_mode, selected_sensors)
+        fig_overall = plot_hourly_loss(
+            rep, 
+            view_mode, 
+            selected_sensors=selected_sensors,
+            show_raw_points=show_raw,
+            show_overall_line=show_overall
+        )
         st.plotly_chart(fig_overall, use_container_width=True)
         
         st.markdown("---")
