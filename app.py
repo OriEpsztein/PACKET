@@ -78,6 +78,7 @@ def packet_loss_hourly_sensor_matrix(
     full_ts = pd.date_range(start=start, end=end, freq=f"{freq_minutes}min")
     wide_full = wide.reindex(full_ts)
 
+    # Floor groups times like 21:15 down to 21:00
     hour_idx = wide_full.index.floor("h")
     ts_per_hour = pd.Series(hour_idx).value_counts().sort_index()
 
@@ -162,7 +163,6 @@ def plot_hourly_loss(
 
     fig = go.Figure()
 
-    # Helper function to consistently draw the overall line
     def draw_overall_line(marker_size=6):
         y_overall = hourly["loss_pct"].to_numpy(dtype=float)
         custom_line = np.stack([
@@ -179,7 +179,8 @@ def plot_hourly_loss(
             line=dict(color="royalblue", width=2), marker=dict(size=marker_size, color="royalblue"),
             customdata=custom_line,
             hovertemplate=(
-                "Hour=%{x|%Y-%m-%d %H:%M}<br>Packet Loss (%)=%{y:.2f}<br>"
+                "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
+                "Packet Loss (%)=%{y:.2f}<br>"
                 "packets_received=%{customdata[0]}<br>expected_packets=%{customdata[1]}<br>"
                 "lost_packets=%{customdata[2]}<br>MEAN=%{customdata[3]:.2f}<br>"
                 "MIN=%{customdata[4]:.2f}<br>MAX=%{customdata[5]:.2f}<extra></extra>"
@@ -214,11 +215,14 @@ def plot_hourly_loss(
             fig.add_trace(go.Scattergl(
                 x=xs, y=ys, mode="markers", name="Sensors (raw points)",
                 marker=dict(size=7, color="rgba(255,140,0,0.5)"), customdata=cd,
-                hovertemplate="Hour=%{x|%Y-%m-%d %H:%M}<br>Packet Loss (%)=%{y:.2f}<br>Sensors=%{customdata[0]} / %{customdata[1]}<extra></extra>"
+                hovertemplate=(
+                    "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
+                    "Packet Loss (%)=%{y:.2f}<br>"
+                    "Sensors=%{customdata[0]} / %{customdata[1]}<extra></extra>"
+                )
             ))
             
         if show_overall_line:
-            # Draw slightly larger markers to stand out from the raw points
             draw_overall_line(marker_size=10)
 
     elif view_mode == "Specific Sensors" and selected_sensors:
@@ -227,15 +231,17 @@ def plot_hourly_loss(
                 y_sensor = loss_mat[sensor].to_numpy(dtype=float)
                 fig.add_trace(go.Scatter(
                     x=hours, y=y_sensor, mode="lines+markers", name=f"Sensor {sensor}",
-                    hovertemplate="Hour=%{x|%Y-%m-%d %H:%M}<br>Sensor " + str(sensor) + "<br>Packet Loss (%)=%{y:.2f}<extra></extra>"
+                    hovertemplate=(
+                        "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
+                        "Sensor " + str(sensor) + "<br>"
+                        "Packet Loss (%)=%{y:.2f}<extra></extra>"
+                    )
                 ))
 
-    # Formatting
     tick0 = pd.to_datetime(hours_index.min()).floor("d")
     tick_vals = pd.date_range(start=tick0, end=pd.to_datetime(hours_index.max()).ceil("h"), freq=f"{tick_every_hours}h")
     tick_text = [f"{t:%H:%M}<br>{t:%Y-%m-%d}" if t.hour == 0 else f"{t:%H:%M}<br>" for t in tick_vals]
 
-    # Adjust hovermode based on the current view
     if view_mode in ["Raw Points", "Specific Sensors"]:
         hmode = "closest"
     else:
@@ -243,11 +249,10 @@ def plot_hourly_loss(
 
     fig.update_layout(
         template="plotly_white",
-        xaxis_title="Hour", yaxis_title="Packet Loss (%)",
+        xaxis_title="Hour Start Time", yaxis_title="Packet Loss (%)",
         margin=dict(t=30, b=90),
         yaxis=dict(range=[0, 100], autorange=True),
         hovermode=hmode,
-        # Move legend to the bottom
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     )
     
@@ -311,9 +316,7 @@ def sensor_overall_packet_loss(file_buffer, freq_minutes: int = 3, keep_full_hou
     return out.sort_values("loss_pct")
 
 
-def plot_sensor_loss_distribution(file_buffer, freq_minutes: int = 3, keep_full_hours_only: bool = True, bin_size: float = 0.5) -> go.Figure:
-    df_s = sensor_overall_packet_loss(file_buffer, freq_minutes, keep_full_hours_only)
-
+def plot_sensor_loss_distribution(df_s: pd.DataFrame, bin_size: float = 0.5) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Histogram(
         x=df_s["loss_pct"], xbins=dict(start=0, end=100, size=bin_size),
@@ -324,7 +327,6 @@ def plot_sensor_loss_distribution(file_buffer, freq_minutes: int = 3, keep_full_
         template="plotly_white", title="Distribution of Sensor Packet Loss (%)",
         xaxis_title="Packet Loss (%)", yaxis_title="Count", bargap=0.05,
         showlegend=True,
-        # Move legend to the bottom
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     )
     fig.update_xaxes(range=[0, df_s["loss_pct"].max()+1])
@@ -339,7 +341,7 @@ st.title("Field 4D: Packet Loss Analysis")
 
 st.sidebar.header("Data Settings")
 
-# Checkbox with help tooltip ('?' icon)
+# Checkbox with help tooltip
 keep_full = st.sidebar.checkbox(
     "Show full hours only", 
     value=True, 
@@ -367,7 +369,38 @@ if uploaded_file is not None:
 
         st.success("File loaded and analyzed successfully!")
 
-        # 1. Main Data Computation
+        # --- High Packet Loss Sensors Alert ---
+        st.markdown("### High Packet Loss Alert")
+        df_sensor_overall = sensor_overall_packet_loss(
+            uploaded_file, 
+            freq_minutes=FREQ_MINUTES, 
+            keep_full_hours_only=keep_full
+        )
+        
+        high_loss_df = df_sensor_overall[df_sensor_overall["loss_pct"] > 5.0].sort_values(by="loss_pct", ascending=False)
+        
+        if not high_loss_df.empty:
+            st.error(f"🚨 **Attention:** {len(high_loss_df)} sensor(s) have an overall packet loss above 5%.")
+            
+            # Format the dataframe for display
+            display_df = high_loss_df[["sensor", "loss_pct", "lost_packets", "expected_packets"]].rename(
+                columns={
+                    "sensor": "Sensor", 
+                    "loss_pct": "Loss (%)", 
+                    "lost_packets": "Lost Packets", 
+                    "expected_packets": "Expected Packets"
+                }
+            )
+            
+            st.dataframe(
+                display_df.style.format({"Loss (%)": "{:.2f}%"}), 
+                hide_index=True, 
+                use_container_width=True
+            )
+        else:
+            st.success("✅ All sensors are operating at 5% or less overall packet loss.")
+
+        # Main Data Computation for Charts
         rep = packet_loss_hourly_sensor_matrix(
             uploaded_file, 
             freq_minutes=FREQ_MINUTES, 
@@ -376,22 +409,23 @@ if uploaded_file is not None:
 
         st.markdown("---")
         st.subheader("Hourly Packet Loss")
+        
+        # Add UI context for time formatting
+        st.info("🕒 **Note on Timestamps:** Data is grouped by the hour. A point labeled **21:00** represents the 60-minute interval from **21:00 to 21:59**.")
 
-        # 2. View Mode Selection
+        # View Mode Selection
         view_mode = st.radio(
             "Display Mode:", 
             ["Overall Average", "Raw Points", "Specific Sensors"], 
             horizontal=True
         )
         
-        # 3. Dynamic Sub-settings based on chosen view
         selected_sensors = []
         show_raw = True
         show_overall = False
         
         if view_mode == "Specific Sensors":
             sensor_list = rep["hourly_sensor_loss"].columns.tolist()
-            # Select ALL sensors by default
             selected_sensors = st.multiselect("Select sensors to display:", sensor_list, default=sensor_list)
             
         elif view_mode == "Raw Points":
@@ -401,7 +435,7 @@ if uploaded_file is not None:
             with col2:
                 show_overall = st.checkbox("Overlay Overall Average Line", value=True)
 
-        # 4. Render Main Plot
+        # Render Main Plot
         fig_overall = plot_hourly_loss(
             rep, 
             view_mode, 
@@ -413,12 +447,8 @@ if uploaded_file is not None:
         
         st.markdown("---")
         
-        # 5. Render Distribution Plot
-        fig_dist = plot_sensor_loss_distribution(
-            uploaded_file, 
-            freq_minutes=FREQ_MINUTES, 
-            keep_full_hours_only=keep_full
-        )
+        # Render Distribution Plot
+        fig_dist = plot_sensor_loss_distribution(df_sensor_overall)
         st.plotly_chart(fig_dist, use_container_width=True)
 
     except Exception as e:
