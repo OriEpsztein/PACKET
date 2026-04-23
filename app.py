@@ -235,13 +235,20 @@ def plot_hourly_loss(
     tick_vals = pd.date_range(start=tick0, end=pd.to_datetime(hours_index.max()).ceil("h"), freq=f"{tick_every_hours}h")
     tick_text = [f"{t:%H:%M}<br>{t:%Y-%m-%d}" if t.hour == 0 else f"{t:%H:%M}<br>" for t in tick_vals]
 
+    # Adjust hovermode based on the current view
+    if view_mode in ["Raw Points", "Specific Sensors"]:
+        hmode = "closest"
+    else:
+        hmode = "x unified"
+
     fig.update_layout(
         template="plotly_white",
         xaxis_title="Hour", yaxis_title="Packet Loss (%)",
         margin=dict(t=30, b=90),
         yaxis=dict(range=[0, 100], autorange=True),
-        hovermode="x unified" if view_mode != "Raw Points" else "closest",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        hovermode=hmode,
+        # Move legend to the bottom
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     )
     
     fig.update_xaxes(type="date", tickmode="array", tickvals=tick_vals, ticktext=tick_text, tickangle=0, automargin=True)
@@ -316,6 +323,9 @@ def plot_sensor_loss_distribution(file_buffer, freq_minutes: int = 3, keep_full_
     fig.update_layout(
         template="plotly_white", title="Distribution of Sensor Packet Loss (%)",
         xaxis_title="Packet Loss (%)", yaxis_title="Count", bargap=0.05,
+        showlegend=True,
+        # Move legend to the bottom
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     )
     fig.update_xaxes(range=[0, df_s["loss_pct"].max()+1])
     return fig
@@ -381,9 +391,8 @@ if uploaded_file is not None:
         
         if view_mode == "Specific Sensors":
             sensor_list = rep["hourly_sensor_loss"].columns.tolist()
-            # Select the first two sensors by default so the chart isn't empty
-            default_selection = sensor_list[:2] if len(sensor_list) >= 2 else sensor_list
-            selected_sensors = st.multiselect("Select sensors to display:", sensor_list, default=default_selection)
+            # Select ALL sensors by default
+            selected_sensors = st.multiselect("Select sensors to display:", sensor_list, default=sensor_list)
             
         elif view_mode == "Raw Points":
             col1, col2 = st.columns(2)
