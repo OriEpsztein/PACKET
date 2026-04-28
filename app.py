@@ -31,8 +31,7 @@ DEFAULT_BATTERY_LOW_MV = 2700
 DEFAULT_BATTERY_LAST_N = 20
 DEFAULT_BATTERY_ALLOWED_LOW_COUNT = 3
 DEFAULT_STUCK_RUN_THRESHOLD = 4
-DEFAULT_STUCK_ROUND_DECIMALS = 3
-DEFAULT_IGNORE_ZERO_FOR_LIGHT = True
+DEFAULT_STUCK_ROUND_DECIMALS = 2
 
 
 # =========================================================
@@ -473,20 +472,55 @@ def plot_hourly_loss_combined(
                 raw_points_df["loss_bin"].to_numpy(dtype=float),
             ], axis=1)
 
-            fig.add_trace(go.Scattergl(
-                x=raw_points_df["hour"].to_numpy(),
-                y=raw_points_df["loss"].to_numpy(dtype=float),
-                mode="markers",
-                name="Raw Sensor Points",
-                marker=dict(size=7, color="rgba(255,140,0,0.45)"),
-                customdata=custom_points,
-                hovertemplate=(
-                    "Hour: %{x|%Y-%m-%d %H:00}<br>"
-                    "Sensor=%{customdata[0]}<br>"
-                    "Packet Loss (%)=%{y:.2f}<br>"
-                    "Sensors in same bin=%{customdata[1]} / %{customdata[2]}<extra></extra>"
-                ),
-            ))
+            # Split raw points into two traces so hover text can be cleaner:
+            # - if only one sensor is represented by that hour/loss-bin, show the sensor name
+            # - if several sensors overlap in the same hour/loss-bin, do NOT show one random sensor name
+            single_sensor_points = raw_points_df[raw_points_df["bin_count"] == 1].copy()
+            multi_sensor_points = raw_points_df[raw_points_df["bin_count"] > 1].copy()
+
+            if not single_sensor_points.empty:
+                custom_single = np.stack([
+                    single_sensor_points["sensor"].astype(str).to_numpy(),
+                    single_sensor_points["bin_count"].to_numpy(),
+                    np.full(len(single_sensor_points), n_total),
+                    single_sensor_points["loss_bin"].to_numpy(dtype=float),
+                ], axis=1)
+
+                fig.add_trace(go.Scattergl(
+                    x=single_sensor_points["hour"].to_numpy(),
+                    y=single_sensor_points["loss"].to_numpy(dtype=float),
+                    mode="markers",
+                    name="Raw Sensor Point - single sensor",
+                    marker=dict(size=7, color="rgba(255,140,0,0.45)"),
+                    customdata=custom_single,
+                    hovertemplate=(
+                        "Hour: %{x|%Y-%m-%d %H:00}<br>"
+                        "Sensor=%{customdata[0]}<br>"
+                        "Packet Loss (%)=%{y:.2f}<br>"
+                        "Sensors in same bin=%{customdata[1]} / %{customdata[2]}<extra></extra>"
+                    ),
+                ))
+
+            if not multi_sensor_points.empty:
+                custom_multi = np.stack([
+                    multi_sensor_points["bin_count"].to_numpy(),
+                    np.full(len(multi_sensor_points), n_total),
+                    multi_sensor_points["loss_bin"].to_numpy(dtype=float),
+                ], axis=1)
+
+                fig.add_trace(go.Scattergl(
+                    x=multi_sensor_points["hour"].to_numpy(),
+                    y=multi_sensor_points["loss"].to_numpy(dtype=float),
+                    mode="markers",
+                    name="Raw Sensor Points - grouped",
+                    marker=dict(size=7, color="rgba(255,140,0,0.45)"),
+                    customdata=custom_multi,
+                    hovertemplate=(
+                        "Hour: %{x|%Y-%m-%d %H:00}<br>"
+                        "Packet Loss (%)=%{y:.2f}<br>"
+                        "Sensors in same bin=%{customdata[0]} / %{customdata[1]}<extra></extra>"
+                    ),
+                ))
 
     # -------------------------
     # Optional specific sensors
@@ -501,8 +535,8 @@ def plot_hourly_loss_combined(
                     name=f"Sensor {sensor}",
                     hovertemplate=(
                         "Hour: %{x|%Y-%m-%d %H:00}<br>"
-                        "Sensor " + str(sensor) + "<br>"
-                        "Packet Loss (%)=%{y:.2f}<extra></extra>"
+                        "Sensor: " + str(sensor) + "<br>"
+                        "Specific sensor packet loss (%)=%{y:.2f}<extra></extra>"
                     ),
                 ))
 
@@ -555,7 +589,7 @@ def plot_hourly_specific_sensors(
         yaxis_title="Packet Loss (%)",
         margin=dict(t=55, b=90),
         yaxis=dict(rangemode="tozero"),
-        hovermode="x unified",
+        hovermode="closest",
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
     )
 
@@ -759,44 +793,31 @@ def analyze_temperature(
     )
 
 
-def analyze_light(
-    wide: pd.DataFrame,
-    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
-    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
-    ignore_zero_for_light: bool = DEFAULT_IGNORE_ZERO_FOR_LIGHT,
-) -> pd.DataFrame:
-    """Light checks: stuck repeated values.
+def analyze_light(wide: pd.DataFrame) -> pd.DataFrame:
+    """Light check.
 
-    By default, exact 0 is ignored because light sensors can stay at 0 at night.
+    Current requested rule:
+    - Do NOT run stuck-value detection for light.
+    - Stuck-value detection is only for temperature.
+
+    This function still returns a clean per-sensor table so the Light CSV can be
+    previewed in Data Analysis, but it does not mark light sensors as issues.
     """
     rows = []
-    ignore_values = {0.0} if ignore_zero_for_light else None
 
     for sensor in wide.columns:
         s = pd.to_numeric(wide[sensor], errors="coerce").dropna().sort_index()
-        run_info = longest_equal_run(
-            s,
-            decimals=stuck_round_decimals,
-            ignore_values=ignore_values,
-        )
-        is_stuck = run_info["max_stuck_run"] >= stuck_run_threshold
 
         rows.append({
             "sensor": str(sensor),
-            "status": "STUCK_VALUE" if is_stuck else "OK",
-            "has_issue": bool(is_stuck),
+            "status": "OK",
+            "has_issue": False,
             "values_count": int(len(s)),
-            "max_stuck_run": run_info["max_stuck_run"],
-            "stuck_value": run_info["stuck_value"],
-            "stuck_start_time": run_info["stuck_start_time"],
-            "stuck_end_time": run_info["stuck_end_time"],
             "last_value": float(s.iloc[-1]) if len(s) else np.nan,
+            "note": "No stuck-value check for Light. Stuck-value check is only for Temperature.",
         })
 
-    return pd.DataFrame(rows).sort_values(
-        by=["has_issue", "max_stuck_run"],
-        ascending=[False, False],
-    )
+    return pd.DataFrame(rows).sort_values(by=["sensor"])
 
 
 def run_data_health_check(
@@ -807,7 +828,6 @@ def run_data_health_check(
     battery_low_count_limit: int = DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
     stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
     stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
-    ignore_zero_for_light: bool = DEFAULT_IGNORE_ZERO_FOR_LIGHT,
 ) -> pd.DataFrame:
     """Run the correct health check according to selected data type."""
     ts_col = _detect_timestamp_column(df)
@@ -829,12 +849,7 @@ def run_data_health_check(
         )
 
     if data_type == "Light":
-        return analyze_light(
-            wide,
-            stuck_run_threshold=stuck_run_threshold,
-            stuck_round_decimals=stuck_round_decimals,
-            ignore_zero_for_light=ignore_zero_for_light,
-        )
+        return analyze_light(wide)
 
     return pd.DataFrame()
 
@@ -986,7 +1001,6 @@ for i, file in enumerate(uploaded_files, start=1):
                 battery_low_count_limit=DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
                 stuck_run_threshold=DEFAULT_STUCK_RUN_THRESHOLD,
                 stuck_round_decimals=DEFAULT_STUCK_ROUND_DECIMALS,
-                ignore_zero_for_light=DEFAULT_IGNORE_ZERO_FOR_LIGHT,
             )
             issue_df = result_issues_only(health_df)
             row["value_issues_count"] = len(issue_df)
@@ -1233,11 +1247,10 @@ with tab_packet_loss:
 
         else:
             sensor_list = packet_rep["hourly_sensor_loss"].columns.tolist()
-            default_sensor_selection = sensor_list[: min(10, len(sensor_list))]
             selected_sensors = st.multiselect(
                 "Select sensors to display:",
                 sensor_list,
-                default=default_sensor_selection,
+                default=sensor_list,
                 key="packet_specific_sensor_selector",
             )
 
@@ -1278,11 +1291,13 @@ with tab_data_analysis:
     )
 
     st.info(
-        "**How stuck values are checked:** for each sensor, the app sorts values by timestamp, "
-        "rounds values to the selected decimal count, and looks for the longest consecutive run "
-        "of the exact same value. Example: `23, 23, 23, 23` is a stuck run of 4. "
+        "**How stuck values are checked:** this check is now used only for **Temperature** CSVs. "
+        "For each temperature sensor, the app sorts values by timestamp, rounds each value to "
+        "2 digits after the decimal point by default, and looks for the longest consecutive run "
+        "of the same rounded value. Example: `23.001, 23.004, 23.002, 23.003` becomes "
+        "`23.00, 23.00, 23.00, 23.00`, so it is a stuck run of 4. "
         "If the run length is equal to or above the threshold, the sensor is flagged. "
-        "For light, `0` is ignored by default because night values can stay at 0 naturally."
+        "Battery does not use stuck-value checks. Light also does not use stuck-value checks."
     )
 
     with st.expander("Data Analysis Settings", expanded=True):
@@ -1315,32 +1330,26 @@ with tab_data_analysis:
                 step=1,
             )
 
-        col_s1, col_s2, col_s3 = st.columns(3)
+        col_s1, col_s2 = st.columns(2)
 
         with col_s1:
             stuck_run_threshold = st.number_input(
-                "Stuck-value run threshold",
+                "TEMP stuck-value run threshold",
                 min_value=2,
                 max_value=100,
                 value=DEFAULT_STUCK_RUN_THRESHOLD,
                 step=1,
-                help="Example: threshold 4 flags values like 23, 23, 23, 23.",
+                help="Used only for Temperature. Example: threshold 4 flags values like 23.00, 23.00, 23.00, 23.00.",
             )
 
         with col_s2:
             stuck_round_decimals = st.number_input(
-                "Round decimals for stuck check",
+                "TEMP stuck check decimal places",
                 min_value=0,
                 max_value=6,
                 value=DEFAULT_STUCK_ROUND_DECIMALS,
                 step=1,
-            )
-
-        with col_s3:
-            ignore_zero_for_light = st.checkbox(
-                "Ignore 0 for light stuck check",
-                value=DEFAULT_IGNORE_ZERO_FOR_LIGHT,
-                help="Useful because light can stay exactly 0 during the night.",
+                help="Used only for Temperature. Default 2 means 23.001 and 23.004 are both treated as 23.00.",
             )
 
     # Analyze each uploaded file.
@@ -1390,7 +1399,6 @@ with tab_data_analysis:
                     battery_low_count_limit=int(battery_low_count_limit),
                     stuck_run_threshold=int(stuck_run_threshold),
                     stuck_round_decimals=int(stuck_round_decimals),
-                    ignore_zero_for_light=bool(ignore_zero_for_light),
                 )
 
                 issue_df = result_issues_only(result_df)
