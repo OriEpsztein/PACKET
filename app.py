@@ -14,9 +14,29 @@ st.set_page_config(
     layout="wide",
 )
 
+st.title("Field 4D: Sensor Data Analyzer")
+
 
 # =========================================================
-# 1) General helpers
+# 1) Fixed app settings
+# =========================================================
+# You asked to remove this from the UI because the data is always 3 minutes.
+FREQ_MINUTES = 3
+
+# Summary / packet-loss problem threshold.
+PACKET_LOSS_ALERT_PCT = 5.0
+
+# Default health-check rules.
+DEFAULT_BATTERY_LOW_MV = 2700
+DEFAULT_BATTERY_LAST_N = 20
+DEFAULT_BATTERY_ALLOWED_LOW_COUNT = 3
+DEFAULT_STUCK_RUN_THRESHOLD = 4
+DEFAULT_STUCK_ROUND_DECIMALS = 3
+DEFAULT_IGNORE_ZERO_FOR_LIGHT = True
+
+
+# =========================================================
+# 2) General CSV helpers
 # =========================================================
 @st.cache_data(show_spinner=False)
 def read_csv_cached(file_bytes: bytes) -> pd.DataFrame:
@@ -46,7 +66,7 @@ def _detect_timestamp_column(df: pd.DataFrame) -> str:
         if c in df.columns:
             return c
 
-    # fallback: any column name that contains time/date
+    # Fallback: any column name that contains time/date.
     for c in df.columns:
         cl = str(c).lower()
         if "time" in cl or "date" in cl:
@@ -55,7 +75,7 @@ def _detect_timestamp_column(df: pd.DataFrame) -> str:
     raise ValueError("Could not detect a timestamp column. Rename it to 'Timestamp'.")
 
 
-def _detect_sensor_column(df: pd.DataFrame) -> str | None:
+def _detect_sensor_column(df: pd.DataFrame):
     """Detect sensor/name/id column for long-format CSVs.
 
     If this returns None, the file is treated as wide format:
@@ -75,7 +95,7 @@ def _detect_sensor_column(df: pd.DataFrame) -> str | None:
     return None
 
 
-def detect_data_type(file_name: str, df: pd.DataFrame | None = None) -> str:
+def detect_data_type(file_name: str, df: pd.DataFrame = None) -> str:
     """Auto-detect whether the uploaded CSV is Battery / Temperature / Light / Other."""
     name = str(file_name).lower()
 
@@ -98,7 +118,7 @@ def detect_data_type(file_name: str, df: pd.DataFrame | None = None) -> str:
     return "Other"
 
 
-def _value_candidates_for_type(data_type: str) -> list[str]:
+def _value_candidates_for_type(data_type: str) -> list:
     """Preferred value columns for long-format files."""
     if data_type == "Battery":
         return [
@@ -121,11 +141,7 @@ def _value_candidates_for_type(data_type: str) -> list[str]:
     return []
 
 
-def _choose_value_column(
-    df: pd.DataFrame,
-    ignore_cols: list[str],
-    data_type: str | None = None,
-) -> str:
+def _choose_value_column(df: pd.DataFrame, ignore_cols: list, data_type: str = None) -> str:
     """Choose the value column for long-format data."""
     if data_type is not None:
         for c in _value_candidates_for_type(data_type):
@@ -134,17 +150,19 @@ def _choose_value_column(
 
     possible_cols = [c for c in df.columns if c not in ignore_cols]
 
-    # Prefer numeric columns.
+    # Prefer columns already read by pandas as numeric.
     numeric_cols = [c for c in possible_cols if pd.api.types.is_numeric_dtype(df[c])]
     if numeric_cols:
         return numeric_cols[0]
 
-    # Fallback: try converting columns to numeric and keep the one with most values.
+    # Fallback: try converting columns to numeric and keep the one with most valid numbers.
     best_col = None
     best_count = -1
+
     for c in possible_cols:
         converted = pd.to_numeric(df[c], errors="coerce")
         count = int(converted.notna().sum())
+
         if count > best_count:
             best_col = c
             best_count = count
@@ -155,11 +173,7 @@ def _choose_value_column(
     return best_col
 
 
-def _to_wide_timeseries(
-    df: pd.DataFrame,
-    ts_col: str,
-    data_type: str | None = None,
-) -> pd.DataFrame:
+def _to_wide_timeseries(df: pd.DataFrame, ts_col: str, data_type: str = None) -> pd.DataFrame:
     """Convert wide or long sensor data into wide time-series format.
 
     Output format:
@@ -197,7 +211,11 @@ def _to_wide_timeseries(
     # LONG FORMAT:
     # Timestamp | Sensor/Name | value
     # -----------------------------------------------------
-    value_col = _choose_value_column(df, ignore_cols=[ts_col, sensor_col], data_type=data_type)
+    value_col = _choose_value_column(
+        df,
+        ignore_cols=[ts_col, sensor_col],
+        data_type=data_type,
+    )
 
     temp = df[[ts_col, sensor_col, value_col]].copy()
     temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
@@ -241,64 +259,66 @@ def get_basic_file_info(uploaded_file) -> dict:
 
 
 # =========================================================
-# 2) Packet-loss computation
+# 3) Packet-loss computation
 # =========================================================
-def packet_loss_hourly_sensor_matrix(
-    df: pd.DataFrame,
-    freq_minutes: int = 3,
-    keep_full_hours_only: bool = True,
-) -> dict:
-    """Compute hourly packet loss per sensor and overall."""
+def _build_full_timestamp_grid(wide: pd.DataFrame, freq_minutes: int = FREQ_MINUTES) -> pd.DatetimeIndex:
+    """Create the expected timestamp grid from the first timestamp to the last timestamp.
+
+    Important change:
+    - We do NOT remove partial hours.
+    - Partial hours are calculated according to how many 3-minute timestamps should exist
+      inside that partial time window.
+
+    Example:
+    If the file starts at 10:15 and ends at 12:42, the 10:00 hour is expected to have
+    only the timestamps from 10:15, 10:18, ... 10:57. It is not forced to 20.
+    """
+    start = pd.to_datetime(wide.index.min())
+    end = pd.to_datetime(wide.index.max())
+
+    if pd.isna(start) or pd.isna(end):
+        raise ValueError("Could not build timestamp grid because start/end time is missing.")
+
+    return pd.date_range(start=start, end=end, freq=f"{freq_minutes}min")
+
+
+def packet_loss_hourly_sensor_matrix(df: pd.DataFrame, freq_minutes: int = FREQ_MINUTES) -> dict:
+    """Compute hourly packet loss per sensor and overall.
+
+    This version always uses 3-minute sampling and always keeps partial hours.
+    For partial hours, expected packets are based on the real number of expected
+    3-minute timestamps in that partial hour.
+    """
     ts_col = _detect_timestamp_column(df)
     wide = _to_wide_timeseries(df, ts_col)
 
     sensors = list(wide.columns)
     n_total = len(sensors)
-    expected_per_hour = int(round(60 / freq_minutes))
 
-    # Full timestamp grid so missing timestamps count as lost packets.
-    start = wide.index.min().floor(f"{freq_minutes}min")
-    end = wide.index.max().ceil(f"{freq_minutes}min")
-    full_ts = pd.date_range(start=start, end=end, freq=f"{freq_minutes}min")
+    full_ts = _build_full_timestamp_grid(wide, freq_minutes=freq_minutes)
     wide_full = wide.reindex(full_ts)
 
+    # Count how many expected timestamps exist in each hour.
     hour_idx = wide_full.index.floor("h")
-    ts_per_hour = pd.Series(hour_idx).value_counts().sort_index()
+    expected_timestamps_per_hour = pd.Series(hour_idx).value_counts().sort_index()
 
-    if keep_full_hours_only:
-        hours_used = ts_per_hour[ts_per_hour == expected_per_hour].index
-    else:
-        hours_used = ts_per_hour.index
+    present = wide_full.notna()
+    received_hour_sensor = present.groupby(wide_full.index.floor("h")).sum()
 
-    wide_use = wide_full.loc[hour_idx.isin(hours_used)]
-    if wide_use.empty:
-        raise ValueError("No hours left after filtering. Try unchecking 'Show full hours only'.")
-
-    present = wide_use.notna()
-    received_hour_sensor = present.groupby(wide_use.index.floor("h")).sum()
-
-    if keep_full_hours_only:
-        expected_hour_sensor = pd.DataFrame(
-            expected_per_hour,
-            index=received_hour_sensor.index,
-            columns=received_hour_sensor.columns,
-        )
-    else:
-        ts_per_hour_used = pd.Series(wide_use.index.floor("h")).value_counts().sort_index()
-        expected_hour_sensor = pd.DataFrame(
-            np.repeat(ts_per_hour_used.values[:, None], n_total, axis=1),
-            index=ts_per_hour_used.index,
-            columns=sensors,
-        ).reindex(received_hour_sensor.index)
+    expected_hour_sensor = pd.DataFrame(
+        np.repeat(expected_timestamps_per_hour.values[:, None], n_total, axis=1),
+        index=expected_timestamps_per_hour.index,
+        columns=sensors,
+    ).reindex(received_hour_sensor.index)
 
     lost_hour_sensor = (expected_hour_sensor - received_hour_sensor).clip(lower=0)
-    hourly_sensor_loss = (lost_hour_sensor / expected_hour_sensor) * 100.0
+    hourly_sensor_loss = (lost_hour_sensor / expected_hour_sensor.replace(0, np.nan)) * 100.0
 
-    # Hourly totals across sensors.
+    # Hourly totals across all sensors.
     rec_all = received_hour_sensor.sum(axis=1).astype(int)
     exp_all = expected_hour_sensor.sum(axis=1).astype(int)
     lost_all = (exp_all - rec_all).clip(lower=0).astype(int)
-    overall_loss_pct = (lost_all / exp_all.replace(0, np.nan) * 100.0).astype(float)
+    overall_loss_pct = lost_all / exp_all.replace(0, np.nan) * 100.0
 
     hourly_overall = pd.DataFrame({
         "hour": pd.to_datetime(rec_all.index),
@@ -321,54 +341,36 @@ def packet_loss_hourly_sensor_matrix(
         "hourly_sensor_loss": hourly_sensor_loss,
         "stats": stats,
         "n_total": n_total,
+        "freq_minutes": freq_minutes,
     }
 
 
-def sensor_overall_packet_loss(
-    df: pd.DataFrame,
-    freq_minutes: int = 3,
-    keep_full_hours_only: bool = True,
-) -> pd.DataFrame:
-    """Overall packet loss per sensor across the selected file."""
+def sensor_overall_packet_loss(df: pd.DataFrame, freq_minutes: int = FREQ_MINUTES) -> pd.DataFrame:
+    """Overall packet loss per sensor across the file.
+
+    Partial first/last hours are included using the expected number of timestamps
+    between the first timestamp and last timestamp.
+    """
     ts_col = _detect_timestamp_column(df)
     wide = _to_wide_timeseries(df, ts_col)
 
     sensors = list(wide.columns)
-    expected_per_hour = int(round(60 / freq_minutes))
+    n_total = len(sensors)
 
-    start = wide.index.min().floor(f"{freq_minutes}min")
-    end = wide.index.max().ceil(f"{freq_minutes}min")
-    full_ts = pd.date_range(start=start, end=end, freq=f"{freq_minutes}min")
+    full_ts = _build_full_timestamp_grid(wide, freq_minutes=freq_minutes)
     wide_full = wide.reindex(full_ts)
 
     hour_idx = wide_full.index.floor("h")
-    ts_per_hour = pd.Series(hour_idx).value_counts().sort_index()
+    expected_timestamps_per_hour = pd.Series(hour_idx).value_counts().sort_index()
 
-    if keep_full_hours_only:
-        hours_used = ts_per_hour[ts_per_hour == expected_per_hour].index
-    else:
-        hours_used = ts_per_hour.index
+    present = wide_full.notna()
+    received_hour_sensor = present.groupby(wide_full.index.floor("h")).sum()
 
-    wide_use = wide_full.loc[hour_idx.isin(hours_used)]
-    if wide_use.empty:
-        raise ValueError("No hours left after filtering. Try unchecking 'Show full hours only'.")
-
-    present = wide_use.notna()
-    received_hour_sensor = present.groupby(wide_use.index.floor("h")).sum()
-
-    if keep_full_hours_only:
-        expected_hour_sensor = pd.DataFrame(
-            expected_per_hour,
-            index=received_hour_sensor.index,
-            columns=received_hour_sensor.columns,
-        )
-    else:
-        ts_per_hour_used = pd.Series(wide_use.index.floor("h")).value_counts().sort_index()
-        expected_hour_sensor = pd.DataFrame(
-            np.repeat(ts_per_hour_used.values[:, None], len(sensors), axis=1),
-            index=ts_per_hour_used.index,
-            columns=sensors,
-        ).reindex(received_hour_sensor.index)
+    expected_hour_sensor = pd.DataFrame(
+        np.repeat(expected_timestamps_per_hour.values[:, None], n_total, axis=1),
+        index=expected_timestamps_per_hour.index,
+        columns=sensors,
+    ).reindex(received_hour_sensor.index)
 
     rec_total = received_hour_sensor.sum(axis=0).astype(int)
     exp_total = expected_hour_sensor.sum(axis=0).astype(int)
@@ -387,18 +389,22 @@ def sensor_overall_packet_loss(
 
 
 # =========================================================
-# 3) Packet-loss plot functions
+# 4) Packet-loss plot functions
 # =========================================================
-def plot_hourly_loss(
+def plot_hourly_loss_combined(
     rep: dict,
-    view_mode: str,
-    selected_sensors: list | None = None,
-    show_raw_points: bool = True,
-    show_overall_line: bool = False,
-    tick_every_hours: int = 4,
+    show_raw_points: bool = False,
+    show_specific_sensors: bool = False,
+    selected_sensors: list = None,
     bin_size: float = 0.5,
 ) -> go.Figure:
-    """Main packet-loss plot."""
+    """Hourly packet-loss plot.
+
+    Always shows the overall average.
+    Optional overlays:
+    - raw sensor points
+    - selected specific sensor lines
+    """
     hourly = rep["hourly_overall"]
     loss_mat = rep["hourly_sensor_loss"]
     stats = rep["stats"]
@@ -409,128 +415,109 @@ def plot_hourly_loss(
 
     fig = go.Figure()
 
-    def draw_overall_line(marker_size: int = 6):
-        y_overall = hourly["loss_pct"].to_numpy(dtype=float)
-        custom_line = np.stack([
-            hourly["packets_received"].to_numpy(),
-            hourly["expected_packets"].to_numpy(),
-            hourly["lost_packets"].to_numpy(),
-            stats["mean"].to_numpy(dtype=float),
-            stats["min"].to_numpy(dtype=float),
-            stats["max"].to_numpy(dtype=float),
-        ], axis=1)
+    # -------------------------
+    # Overall average line
+    # -------------------------
+    custom_line = np.stack([
+        hourly["packets_received"].to_numpy(),
+        hourly["expected_packets"].to_numpy(),
+        hourly["lost_packets"].to_numpy(),
+        stats["mean"].to_numpy(dtype=float),
+        stats["min"].to_numpy(dtype=float),
+        stats["max"].to_numpy(dtype=float),
+    ], axis=1)
 
-        fig.add_trace(go.Scatter(
-            x=hours,
-            y=y_overall,
-            mode="lines+markers",
-            name="Overall Average",
-            line=dict(color="royalblue", width=2),
-            marker=dict(size=marker_size, color="royalblue"),
-            customdata=custom_line,
-            hovertemplate=(
-                "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
-                "Packet Loss (%)=%{y:.2f}<br>"
-                "packets_received=%{customdata[0]}<br>"
-                "expected_packets=%{customdata[1]}<br>"
-                "lost_packets=%{customdata[2]}<br>"
-                "MEAN=%{customdata[3]:.2f}<br>"
-                "MIN=%{customdata[4]:.2f}<br>"
-                "MAX=%{customdata[5]:.2f}<extra></extra>"
-            ),
-        ))
+    fig.add_trace(go.Scatter(
+        x=hours,
+        y=hourly["loss_pct"].to_numpy(dtype=float),
+        mode="lines+markers",
+        name="Overall Average",
+        line=dict(color="royalblue", width=2),
+        marker=dict(size=6, color="royalblue"),
+        customdata=custom_line,
+        hovertemplate=(
+            "Hour: %{x|%Y-%m-%d %H:00}<br>"
+            "Packet Loss (%)=%{y:.2f}<br>"
+            "packets_received=%{customdata[0]}<br>"
+            "expected_packets=%{customdata[1]}<br>"
+            "lost_packets=%{customdata[2]}<br>"
+            "MEAN sensor loss=%{customdata[3]:.2f}<br>"
+            "MIN sensor loss=%{customdata[4]:.2f}<br>"
+            "MAX sensor loss=%{customdata[5]:.2f}<extra></extra>"
+        ),
+    ))
 
-    if view_mode == "Overall Average":
-        draw_overall_line(marker_size=6)
+    # -------------------------
+    # Optional raw points
+    # -------------------------
+    if show_raw_points:
+        rows = []
 
-    elif view_mode == "Raw Points":
-        if show_raw_points:
-            rows = []
+        for h in hours_index:
+            row = loss_mat.loc[h].dropna()
 
-            for h in hours_index:
-                row = loss_mat.loc[h].dropna()
-                for sensor_name, value in row.items():
-                    value = float(np.clip(value, 0, 100))
-                    loss_bin = float(np.round(value / bin_size) * bin_size)
-                    rows.append((h, str(sensor_name), value, loss_bin))
+            for sensor_name, value in row.items():
+                value = float(np.clip(value, 0, 100))
+                loss_bin = float(np.round(value / bin_size) * bin_size)
+                rows.append((h, str(sensor_name), value, loss_bin))
 
-            dfp = pd.DataFrame(rows, columns=["hour", "sensor", "loss", "loss_bin"])
+        raw_points_df = pd.DataFrame(rows, columns=["hour", "sensor", "loss", "loss_bin"])
 
-            if not dfp.empty:
-                dfp["bin_count"] = dfp.groupby(["hour", "loss_bin"])["loss_bin"].transform("size")
+        if not raw_points_df.empty:
+            raw_points_df["bin_count"] = raw_points_df.groupby(["hour", "loss_bin"])["loss_bin"].transform("size")
 
-                custom_points = np.stack([
-                    dfp["sensor"].astype(str).to_numpy(),
-                    dfp["bin_count"].to_numpy(),
-                    np.full(len(dfp), n_total),
-                    dfp["loss_bin"].to_numpy(dtype=float),
-                ], axis=1)
+            custom_points = np.stack([
+                raw_points_df["sensor"].astype(str).to_numpy(),
+                raw_points_df["bin_count"].to_numpy(),
+                np.full(len(raw_points_df), n_total),
+                raw_points_df["loss_bin"].to_numpy(dtype=float),
+            ], axis=1)
 
-                fig.add_trace(go.Scattergl(
-                    x=dfp["hour"].to_numpy(),
-                    y=dfp["loss"].to_numpy(dtype=float),
-                    mode="markers",
-                    name="Sensors (raw points)",
-                    marker=dict(size=7, color="rgba(255,140,0,0.5)"),
-                    customdata=custom_points,
-                    hovertemplate=(
-                        "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
-                        "Sensor=%{customdata[0]}<br>"
-                        "Packet Loss (%)=%{y:.2f}<br>"
-                        "Sensors in same bin=%{customdata[1]} / %{customdata[2]}<extra></extra>"
-                    ),
-                ))
+            fig.add_trace(go.Scattergl(
+                x=raw_points_df["hour"].to_numpy(),
+                y=raw_points_df["loss"].to_numpy(dtype=float),
+                mode="markers",
+                name="Raw Sensor Points",
+                marker=dict(size=7, color="rgba(255,140,0,0.45)"),
+                customdata=custom_points,
+                hovertemplate=(
+                    "Hour: %{x|%Y-%m-%d %H:00}<br>"
+                    "Sensor=%{customdata[0]}<br>"
+                    "Packet Loss (%)=%{y:.2f}<br>"
+                    "Sensors in same bin=%{customdata[1]} / %{customdata[2]}<extra></extra>"
+                ),
+            ))
 
-        if show_overall_line:
-            draw_overall_line(marker_size=10)
-
-    elif view_mode == "Specific Sensors" and selected_sensors:
+    # -------------------------
+    # Optional specific sensors
+    # -------------------------
+    if show_specific_sensors and selected_sensors:
         for sensor in selected_sensors:
             if sensor in loss_mat.columns:
-                y_sensor = loss_mat[sensor].to_numpy(dtype=float)
                 fig.add_trace(go.Scatter(
                     x=hours,
-                    y=y_sensor,
+                    y=loss_mat[sensor].to_numpy(dtype=float),
                     mode="lines+markers",
                     name=f"Sensor {sensor}",
                     hovertemplate=(
-                        "Time Window: %{x|%Y-%m-%d %H:%M} to %{x|%H}:59<br>"
+                        "Hour: %{x|%Y-%m-%d %H:00}<br>"
                         "Sensor " + str(sensor) + "<br>"
                         "Packet Loss (%)=%{y:.2f}<extra></extra>"
                     ),
                 ))
 
-    tick0 = pd.to_datetime(hours_index.min()).floor("d")
-    tick_vals = pd.date_range(
-        start=tick0,
-        end=pd.to_datetime(hours_index.max()).ceil("h"),
-        freq=f"{tick_every_hours}h",
-    )
-    tick_text = [
-        f"{t:%H:%M}<br>{t:%Y-%m-%d}" if t.hour == 0 else f"{t:%H:%M}<br>"
-        for t in tick_vals
-    ]
-
-    hmode = "closest" if view_mode in ["Raw Points", "Specific Sensors"] else "x unified"
-
     fig.update_layout(
         template="plotly_white",
+        title="Hourly Packet Loss",
         xaxis_title="Hour Start Time",
         yaxis_title="Packet Loss (%)",
-        margin=dict(t=30, b=90),
+        margin=dict(t=55, b=90),
         yaxis=dict(range=[0, 100]),
-        hovermode=hmode,
+        hovermode="closest" if (show_raw_points or show_specific_sensors) else "x unified",
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
     )
 
-    fig.update_xaxes(
-        type="date",
-        tickmode="array",
-        tickvals=tick_vals,
-        ticktext=tick_text,
-        tickangle=0,
-        automargin=True,
-    )
+    fig.update_xaxes(type="date", automargin=True)
 
     return fig
 
@@ -540,6 +527,12 @@ def plot_sensor_loss_distribution(df_s: pd.DataFrame, bin_size: float = 0.5) -> 
     fig = go.Figure()
 
     if df_s.empty:
+        fig.update_layout(
+            template="plotly_white",
+            title="Distribution of Sensor Packet Loss (%)",
+            xaxis_title="Packet Loss (%)",
+            yaxis_title="Count",
+        )
         return fig
 
     max_x = max(1.0, float(df_s["loss_pct"].max()) + 1.0)
@@ -566,20 +559,20 @@ def plot_sensor_loss_distribution(df_s: pd.DataFrame, bin_size: float = 0.5) -> 
 
 
 # =========================================================
-# 4) Data-analysis health checks
+# 5) Data-analysis health checks
 # =========================================================
 def analyze_battery(
     wide: pd.DataFrame,
-    low_mv_threshold: float = 2700,
-    last_n: int = 20,
-    low_count_limit: int = 3,
+    low_mv_threshold: float = DEFAULT_BATTERY_LOW_MV,
+    last_n: int = DEFAULT_BATTERY_LAST_N,
+    low_count_limit: int = DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
 ) -> pd.DataFrame:
     """Battery health rule.
 
-    Rule requested:
+    Requested rule:
     - Take last 20 values.
-    - If more than 3 are under 2700 mV -> LOW_BATTERY.
-    - If there are only 3 or fewer timestamps to check -> flag if at least 1 is under 2700 mV.
+    - If more than 3 values are under 2700 mV -> LOW_BATTERY.
+    - If there are 3 or fewer timestamps to check -> flag if at least 1 value is under 2700 mV.
     """
     rows = []
 
@@ -608,6 +601,7 @@ def analyze_battery(
         rows.append({
             "sensor": str(sensor),
             "status": status,
+            "has_issue": bool(issue),
             "values_checked": n_checked,
             "under_threshold_count": under_count,
             "threshold_mV": low_mv_threshold,
@@ -619,16 +613,12 @@ def analyze_battery(
         })
 
     return pd.DataFrame(rows).sort_values(
-        by=["status", "under_threshold_count", "min_last_values_mV"],
-        ascending=[True, False, True],
+        by=["has_issue", "under_threshold_count", "min_last_values_mV"],
+        ascending=[False, False, True],
     )
 
 
-def longest_equal_run(
-    series: pd.Series,
-    decimals: int = 3,
-    ignore_values: set[float] | None = None,
-) -> dict:
+def longest_equal_run(series: pd.Series, decimals: int = DEFAULT_STUCK_ROUND_DECIMALS, ignore_values: set = None) -> dict:
     """Find the longest consecutive run of equal values.
 
     Example: 23, 23, 23, 23 -> run length 4.
@@ -682,8 +672,8 @@ def longest_equal_run(
 
 def analyze_temperature(
     wide: pd.DataFrame,
-    stuck_run_threshold: int = 4,
-    stuck_round_decimals: int = 3,
+    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
+    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
     bad_temp_value: float = -40,
 ) -> pd.DataFrame:
     """Temperature checks: -40 values and stuck repeated values."""
@@ -704,9 +694,12 @@ def analyze_temperature(
         if is_stuck:
             issues.append("STUCK_VALUE")
 
+        has_issue = len(issues) > 0
+
         rows.append({
             "sensor": str(sensor),
-            "status": "OK" if not issues else " / ".join(issues),
+            "status": "OK" if not has_issue else " / ".join(issues),
+            "has_issue": has_issue,
             "values_count": int(len(s)),
             "minus_40_count": bad_temp_count,
             "first_minus_40_time": s[bad_temp_mask].index.min() if bad_temp_count else pd.NaT,
@@ -719,16 +712,16 @@ def analyze_temperature(
         })
 
     return pd.DataFrame(rows).sort_values(
-        by=["status", "minus_40_count", "max_stuck_run"],
-        ascending=[True, False, False],
+        by=["has_issue", "minus_40_count", "max_stuck_run"],
+        ascending=[False, False, False],
     )
 
 
 def analyze_light(
     wide: pd.DataFrame,
-    stuck_run_threshold: int = 4,
-    stuck_round_decimals: int = 3,
-    ignore_zero_for_light: bool = True,
+    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
+    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
+    ignore_zero_for_light: bool = DEFAULT_IGNORE_ZERO_FOR_LIGHT,
 ) -> pd.DataFrame:
     """Light checks: stuck repeated values.
 
@@ -739,12 +732,17 @@ def analyze_light(
 
     for sensor in wide.columns:
         s = pd.to_numeric(wide[sensor], errors="coerce").dropna().sort_index()
-        run_info = longest_equal_run(s, decimals=stuck_round_decimals, ignore_values=ignore_values)
+        run_info = longest_equal_run(
+            s,
+            decimals=stuck_round_decimals,
+            ignore_values=ignore_values,
+        )
         is_stuck = run_info["max_stuck_run"] >= stuck_run_threshold
 
         rows.append({
             "sensor": str(sensor),
             "status": "STUCK_VALUE" if is_stuck else "OK",
+            "has_issue": bool(is_stuck),
             "values_count": int(len(s)),
             "max_stuck_run": run_info["max_stuck_run"],
             "stuck_value": run_info["stuck_value"],
@@ -754,20 +752,20 @@ def analyze_light(
         })
 
     return pd.DataFrame(rows).sort_values(
-        by=["status", "max_stuck_run"],
-        ascending=[True, False],
+        by=["has_issue", "max_stuck_run"],
+        ascending=[False, False],
     )
 
 
 def run_data_health_check(
     df: pd.DataFrame,
     data_type: str,
-    battery_threshold_mv: float,
-    battery_last_n: int,
-    battery_low_count_limit: int,
-    stuck_run_threshold: int,
-    stuck_round_decimals: int,
-    ignore_zero_for_light: bool,
+    battery_threshold_mv: float = DEFAULT_BATTERY_LOW_MV,
+    battery_last_n: int = DEFAULT_BATTERY_LAST_N,
+    battery_low_count_limit: int = DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
+    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
+    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
+    ignore_zero_for_light: bool = DEFAULT_IGNORE_ZERO_FOR_LIGHT,
 ) -> pd.DataFrame:
     """Run the correct health check according to selected data type."""
     ts_col = _detect_timestamp_column(df)
@@ -800,18 +798,39 @@ def run_data_health_check(
 
 
 def count_data_issues(result_df: pd.DataFrame) -> int:
-    """Count rows that are not OK."""
-    if result_df.empty or "status" not in result_df.columns:
+    """Count rows that have an issue."""
+    if result_df.empty:
         return 0
-    return int((result_df["status"] != "OK").sum())
+
+    if "has_issue" in result_df.columns:
+        return int(result_df["has_issue"].sum())
+
+    if "status" in result_df.columns:
+        return int((result_df["status"] != "OK").sum())
+
+    return 0
+
+
+def result_issues_only(result_df: pd.DataFrame) -> pd.DataFrame:
+    """Return only problematic sensors from a health-check dataframe."""
+    if result_df.empty:
+        return result_df
+
+    if "has_issue" in result_df.columns:
+        return result_df[result_df["has_issue"]].copy()
+
+    if "status" in result_df.columns:
+        return result_df[result_df["status"] != "OK"].copy()
+
+    return result_df.iloc[0:0].copy()
 
 
 # =========================================================
-# 5) Extra plotting for data analysis
+# 6) Extra plotting for data analysis
 # =========================================================
 def plot_last_values_for_sensors(
     wide: pd.DataFrame,
-    sensors: list[str],
+    sensors: list,
     title: str,
     last_n: int = 20,
 ) -> go.Figure:
@@ -823,6 +842,7 @@ def plot_last_values_for_sensors(
             continue
 
         s = pd.to_numeric(wide[sensor], errors="coerce").dropna().sort_index().tail(last_n)
+
         if s.empty:
             continue
 
@@ -847,67 +867,134 @@ def plot_last_values_for_sensors(
 
 
 # =========================================================
-# 6) Sidebar - Data Settings
+# 7) Sidebar - Data Settings
 # =========================================================
-st.title("Field 4D: Sensor Data Analyzer")
-
 st.sidebar.header("Data Settings")
 
 uploaded_files = st.sidebar.file_uploader(
     "Upload CSV / CSVs",
     type=["csv"],
     accept_multiple_files=True,
-    help="Upload one or several CSV files. Then choose which file to analyze below.",
-)
-
-FREQ_MINUTES = st.sidebar.number_input(
-    "Expected sampling interval (minutes)",
-    min_value=1,
-    max_value=60,
-    value=3,
-    step=1,
-)
-
-keep_full = st.sidebar.checkbox(
-    "Show full hours only",
-    value=True,
-    help="Ignores partial hours at the start or end of your dataset so percentages are based on full hourly windows.",
-)
-
-tick_every_hours = st.sidebar.slider(
-    "X-axis tick every N hours",
-    min_value=1,
-    max_value=24,
-    value=4,
-    step=1,
+    help="Upload one or several CSV files. Packet Loss uses the first CSV automatically.",
 )
 
 if not uploaded_files:
     st.info("Upload one or more CSV files from the left sidebar to begin analysis.")
     st.stop()
 
-# Unique labels even if two files have the same name.
-file_labels = [f"{i + 1}. {file.name}" for i, file in enumerate(uploaded_files)]
-selected_label = st.sidebar.selectbox("Choose CSV to analyze", file_labels)
-selected_index = file_labels.index(selected_label)
-selected_file = uploaded_files[selected_index]
-selected_df = read_uploaded_csv(selected_file)
+# No sidebar file selector: packet loss always uses the first CSV.
+packet_loss_file = uploaded_files[0]
+packet_loss_df = read_uploaded_csv(packet_loss_file)
 
-# Display selected dataset range in the sidebar.
-try:
-    selected_info = get_basic_file_info(selected_file)
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Selected Dataset Range:**")
-    st.sidebar.text(f"Start: {selected_info['start']:%Y-%m-%d %H:%M}")
-    st.sidebar.text(f"End:   {selected_info['end']:%Y-%m-%d %H:%M}")
-    st.sidebar.text(f"Sensors: {selected_info['sensors']}")
-    st.sidebar.text(f"Auto type: {selected_info['auto_type']}")
-except Exception as e:
-    st.sidebar.error(f"Could not read selected file info: {e}")
+# Sidebar display only: uploaded files + range.
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Uploaded files:**")
+
+for i, file in enumerate(uploaded_files, start=1):
+    try:
+        info = get_basic_file_info(file)
+        st.sidebar.caption(
+            f"{i}. {file.name}\n\n"
+            f"{info['start']:%Y-%m-%d %H:%M} → {info['end']:%Y-%m-%d %H:%M}\n\n"
+            f"Sensors: {info['sensors']} | Type: {info['auto_type']}"
+        )
+    except Exception as e:
+        st.sidebar.caption(f"{i}. {file.name} - could not read info: {e}")
 
 
 # =========================================================
-# 7) Tabs
+# 8) Pre-compute packet loss for the first CSV
+# =========================================================
+packet_rep = None
+packet_sensor_loss_df = pd.DataFrame()
+packet_problem_df = pd.DataFrame()
+packet_error = None
+
+try:
+    packet_rep = packet_loss_hourly_sensor_matrix(packet_loss_df, freq_minutes=FREQ_MINUTES)
+    packet_sensor_loss_df = sensor_overall_packet_loss(packet_loss_df, freq_minutes=FREQ_MINUTES)
+    packet_problem_df = packet_sensor_loss_df[
+        packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT
+    ].copy()
+except Exception as e:
+    packet_error = e
+
+
+# =========================================================
+# 9) Pre-compute value issues for summary, using default rules
+# =========================================================
+summary_value_issue_rows = []
+summary_file_rows = []
+
+for i, file in enumerate(uploaded_files, start=1):
+    row = {
+        "file_number": i,
+        "file": file.name,
+        "rows": np.nan,
+        "sensors": np.nan,
+        "start": pd.NaT,
+        "end": pd.NaT,
+        "auto_type": "Unknown",
+        "value_issues_count": np.nan,
+        "status": "OK",
+    }
+
+    try:
+        raw = read_uploaded_csv(file)
+        ts_col = _detect_timestamp_column(raw)
+        wide = _to_wide_timeseries(raw, ts_col)
+        auto_type = detect_data_type(file.name, raw)
+
+        row["rows"] = len(raw)
+        row["sensors"] = len(wide.columns)
+        row["start"] = pd.to_datetime(wide.index.min())
+        row["end"] = pd.to_datetime(wide.index.max())
+        row["auto_type"] = auto_type
+
+        if auto_type in ["Battery", "Temperature", "Light"]:
+            health_df = run_data_health_check(
+                raw,
+                data_type=auto_type,
+                battery_threshold_mv=DEFAULT_BATTERY_LOW_MV,
+                battery_last_n=DEFAULT_BATTERY_LAST_N,
+                battery_low_count_limit=DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
+                stuck_run_threshold=DEFAULT_STUCK_RUN_THRESHOLD,
+                stuck_round_decimals=DEFAULT_STUCK_ROUND_DECIMALS,
+                ignore_zero_for_light=DEFAULT_IGNORE_ZERO_FOR_LIGHT,
+            )
+            issue_df = result_issues_only(health_df)
+            row["value_issues_count"] = len(issue_df)
+
+            for _, issue_row in issue_df.iterrows():
+                summary_value_issue_rows.append({
+                    "problem_type": "VALUE_ISSUE",
+                    "file": file.name,
+                    "data_type": auto_type,
+                    "sensor": issue_row.get("sensor", ""),
+                    "issue": issue_row.get("status", ""),
+                    "loss_pct": np.nan,
+                    "details": " | ".join([
+                        f"values_checked={issue_row.get('values_checked', issue_row.get('values_count', ''))}",
+                        f"under_threshold_count={issue_row.get('under_threshold_count', '')}",
+                        f"minus_40_count={issue_row.get('minus_40_count', '')}",
+                        f"max_stuck_run={issue_row.get('max_stuck_run', '')}",
+                        f"stuck_value={issue_row.get('stuck_value', '')}",
+                    ]),
+                })
+        else:
+            row["value_issues_count"] = np.nan
+
+    except Exception as e:
+        row["status"] = f"ERROR: {e}"
+
+    summary_file_rows.append(row)
+
+summary_files_df = pd.DataFrame(summary_file_rows)
+summary_value_issues_df = pd.DataFrame(summary_value_issue_rows)
+
+
+# =========================================================
+# 10) Tabs
 # =========================================================
 tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
     "Summary",
@@ -917,144 +1004,95 @@ tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
 
 
 # =========================================================
-# 7A) Summary tab - all uploaded files
+# 10A) Summary tab
 # =========================================================
 with tab_summary:
-    st.subheader("Summary - All Uploaded CSVs")
-
-    summary_rows = []
-
-    # Default analysis settings for summary.
-    summary_battery_threshold_mv = 2700
-    summary_battery_last_n = 20
-    summary_battery_low_count_limit = 3
-    summary_stuck_run_threshold = 4
-    summary_stuck_round_decimals = 3
-    summary_ignore_zero_for_light = True
-
-    for file in uploaded_files:
-        row = {
-            "file": file.name,
-            "rows": np.nan,
-            "sensors": np.nan,
-            "start": pd.NaT,
-            "end": pd.NaT,
-            "auto_type": "Unknown",
-            "overall_packet_loss_%": np.nan,
-            "sensors_packet_loss_>5%": np.nan,
-            "data_issues_count": np.nan,
-            "status": "OK",
-        }
-
-        try:
-            raw = read_uploaded_csv(file)
-            ts_col = _detect_timestamp_column(raw)
-            wide = _to_wide_timeseries(raw, ts_col)
-            auto_type = detect_data_type(file.name, raw)
-
-            row["rows"] = len(raw)
-            row["sensors"] = len(wide.columns)
-            row["start"] = pd.to_datetime(wide.index.min())
-            row["end"] = pd.to_datetime(wide.index.max())
-            row["auto_type"] = auto_type
-
-            # Packet loss summary.
-            rep_summary = packet_loss_hourly_sensor_matrix(
-                raw,
-                freq_minutes=int(FREQ_MINUTES),
-                keep_full_hours_only=keep_full,
-            )
-            hourly = rep_summary["hourly_overall"]
-            expected_total = hourly["expected_packets"].sum()
-            lost_total = hourly["lost_packets"].sum()
-            row["overall_packet_loss_%"] = (
-                lost_total / expected_total * 100 if expected_total > 0 else np.nan
-            )
-
-            sensor_loss_df = sensor_overall_packet_loss(
-                raw,
-                freq_minutes=int(FREQ_MINUTES),
-                keep_full_hours_only=keep_full,
-            )
-            row["sensors_packet_loss_>5%"] = int((sensor_loss_df["loss_pct"] > 5).sum())
-
-            # Data issues summary according to auto-detected type.
-            if auto_type in ["Battery", "Temperature", "Light"]:
-                health_df = run_data_health_check(
-                    raw,
-                    data_type=auto_type,
-                    battery_threshold_mv=summary_battery_threshold_mv,
-                    battery_last_n=summary_battery_last_n,
-                    battery_low_count_limit=summary_battery_low_count_limit,
-                    stuck_run_threshold=summary_stuck_run_threshold,
-                    stuck_round_decimals=summary_stuck_round_decimals,
-                    ignore_zero_for_light=summary_ignore_zero_for_light,
-                )
-                row["data_issues_count"] = count_data_issues(health_df)
-            else:
-                row["data_issues_count"] = np.nan
-
-        except Exception as e:
-            row["status"] = f"ERROR: {e}"
-
-        summary_rows.append(row)
-
-    summary_df = pd.DataFrame(summary_rows)
-
-    st.dataframe(
-        summary_df.style.format({
-            "overall_packet_loss_%": "{:.2f}",
-        }),
-        hide_index=True,
-        use_container_width=True,
-    )
+    st.subheader("Summary")
 
     c1, c2, c3, c4 = st.columns(4)
+
     with c1:
         st.metric("Uploaded files", len(uploaded_files))
-    with c2:
-        st.metric("Selected file", selected_file.name)
-    with c3:
-        ok_files = int((summary_df["status"] == "OK").sum())
-        st.metric("Files read successfully", ok_files)
-    with c4:
-        total_issues = pd.to_numeric(summary_df["data_issues_count"], errors="coerce").sum()
-        st.metric("Detected data issues", int(total_issues))
 
-    st.info(
-        "Summary uses automatic data-type detection. In the Data Analysis tab you can manually choose Battery, Temperature, Light, or Other for the selected file."
-    )
+    with c2:
+        st.metric("Packet-loss CSV", packet_loss_file.name)
+
+    with c3:
+        if packet_sensor_loss_df.empty:
+            st.metric("Sensors > 5% loss", "-")
+        else:
+            st.metric("Sensors > 5% loss", int((packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT).sum()))
+
+    with c4:
+        total_value_issues = int(pd.to_numeric(summary_files_df["value_issues_count"], errors="coerce").fillna(0).sum())
+        st.metric("Value issue sensors", total_value_issues)
+
+    st.markdown("---")
+    st.markdown("### Uploaded CSVs")
+    st.dataframe(summary_files_df, hide_index=True, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### Distribution of Sensor Packet Loss (%)")
+
+    if packet_error is not None:
+        st.error(f"Could not calculate packet loss from the first CSV: {packet_error}")
+    else:
+        st.caption(f"Packet loss is calculated from the first uploaded CSV: **{packet_loss_file.name}**")
+        st.plotly_chart(plot_sensor_loss_distribution(packet_sensor_loss_df), use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### Sensors With Problems")
+
+    problem_rows = []
+
+    if not packet_problem_df.empty:
+        for _, r in packet_problem_df.iterrows():
+            problem_rows.append({
+                "problem_type": "PACKET_LOSS_>5%",
+                "file": packet_loss_file.name,
+                "data_type": "Packet Loss",
+                "sensor": r["sensor"],
+                "issue": f"Packet loss above {PACKET_LOSS_ALERT_PCT:.0f}%",
+                "loss_pct": float(r["loss_pct"]),
+                "details": f"lost_packets={int(r['lost_packets'])} | expected_packets={int(r['expected_packets'])} | received_packets={int(r['packets_received'])}",
+            })
+
+    if not summary_value_issues_df.empty:
+        problem_rows.extend(summary_value_issues_df.to_dict("records"))
+
+    all_problem_df = pd.DataFrame(problem_rows)
+
+    if all_problem_df.empty:
+        st.success("✅ No problematic sensors found: no sensors above 5% packet loss and no value issues detected.")
+    else:
+        st.error(f"🚨 {len(all_problem_df)} problem row(s) found.")
+        st.dataframe(
+            all_problem_df.style.format({"loss_pct": "{:.2f}"}),
+            hide_index=True,
+            use_container_width=True,
+        )
 
 
 # =========================================================
-# 7B) Packet Loss Analysis tab - selected file
+# 10B) Packet Loss Analysis tab - first CSV only
 # =========================================================
 with tab_packet_loss:
-    st.subheader(f"Packet Loss Analysis - {selected_file.name}")
+    st.subheader(f"Packet Loss Analysis - first CSV: {packet_loss_file.name}")
 
-    try:
-        rep = packet_loss_hourly_sensor_matrix(
-            selected_df,
-            freq_minutes=int(FREQ_MINUTES),
-            keep_full_hours_only=keep_full,
-        )
+    if packet_error is not None:
+        st.error(f"Error processing packet-loss analysis: {packet_error}")
+    else:
+        st.caption("Sampling interval is fixed at 3 minutes. Partial hours are included and calculated by their actual expected timestamp count.")
 
-        df_sensor_overall = sensor_overall_packet_loss(
-            selected_df,
-            freq_minutes=int(FREQ_MINUTES),
-            keep_full_hours_only=keep_full,
-        )
-
-        st.success("File loaded and packet-loss analysis completed successfully.")
-
-        # --- High Packet Loss Sensors Alert ---
         st.markdown("### High Packet Loss Alert")
-        high_loss_df = df_sensor_overall[df_sensor_overall["loss_pct"] > 5.0].sort_values(
-            by="loss_pct",
-            ascending=False,
-        )
 
-        if not high_loss_df.empty:
+        high_loss_df = packet_sensor_loss_df[
+            packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT
+        ].sort_values(by="loss_pct", ascending=False)
+
+        if high_loss_df.empty:
+            st.success("✅ All sensors are operating at 5% or less overall packet loss.")
+        else:
             st.error(f"🚨 Attention: {len(high_loss_df)} sensor(s) have overall packet loss above 5%.")
 
             display_df = high_loss_df[[
@@ -1072,233 +1110,228 @@ with tab_packet_loss:
                 hide_index=True,
                 use_container_width=True,
             )
-        else:
-            st.success("✅ All sensors are operating at 5% or less overall packet loss.")
 
         st.markdown("---")
         st.markdown("### Hourly Packet Loss")
-        st.info(
-            "🕒 Data is grouped by hour. A point labeled 21:00 represents the interval from 21:00 to 21:59."
-        )
+        st.info("🕒 Data is grouped by hour. If the first/last hour is partial, expected packets are calculated only for the timestamps that should exist in that partial hour.")
 
-        view_mode = st.radio(
-            "Display Mode:",
-            ["Overall Average", "Raw Points", "Specific Sensors"],
-            horizontal=True,
-        )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            show_raw_points = st.checkbox("Display raw sensor points", value=False)
+
+        with col2:
+            show_specific_sensors = st.checkbox("Display specific sensors", value=False)
 
         selected_sensors = []
-        show_raw = True
-        show_overall = False
-
-        if view_mode == "Specific Sensors":
-            sensor_list = rep["hourly_sensor_loss"].columns.tolist()
+        if show_specific_sensors:
+            sensor_list = packet_rep["hourly_sensor_loss"].columns.tolist()
+            default_sensor_selection = sensor_list[: min(10, len(sensor_list))]
             selected_sensors = st.multiselect(
                 "Select sensors to display:",
                 sensor_list,
-                default=sensor_list,
+                default=default_sensor_selection,
             )
 
-        elif view_mode == "Raw Points":
-            col1, col2 = st.columns(2)
-            with col1:
-                show_raw = st.checkbox("Show Raw Sensor Points", value=True)
-            with col2:
-                show_overall = st.checkbox("Overlay Overall Average Line", value=True)
-
-        fig_overall = plot_hourly_loss(
-            rep,
-            view_mode,
+        fig_hourly = plot_hourly_loss_combined(
+            packet_rep,
+            show_raw_points=show_raw_points,
+            show_specific_sensors=show_specific_sensors,
             selected_sensors=selected_sensors,
-            show_raw_points=show_raw,
-            show_overall_line=show_overall,
-            tick_every_hours=int(tick_every_hours),
         )
-        st.plotly_chart(fig_overall, use_container_width=True)
+        st.plotly_chart(fig_hourly, use_container_width=True)
 
         st.markdown("---")
-        fig_dist = plot_sensor_loss_distribution(df_sensor_overall)
-        st.plotly_chart(fig_dist, use_container_width=True)
+        st.markdown("### Distribution of Sensor Packet Loss (%)")
+        st.plotly_chart(plot_sensor_loss_distribution(packet_sensor_loss_df), use_container_width=True)
 
         with st.expander("Show full sensor packet-loss table"):
             st.dataframe(
-                df_sensor_overall.style.format({"loss_pct": "{:.2f}%"}),
+                packet_sensor_loss_df.style.format({"loss_pct": "{:.2f}%"}),
                 hide_index=True,
                 use_container_width=True,
             )
 
-    except Exception as e:
-        st.error(f"Error processing packet-loss analysis: {e}")
-
 
 # =========================================================
-# 7C) Data Analysis tab - selected file
+# 10C) Data Analysis tab - all uploaded CSVs
 # =========================================================
 with tab_data_analysis:
-    st.subheader(f"Data Analysis - {selected_file.name}")
+    st.subheader("Data Analysis - All Uploaded CSVs")
 
-    try:
-        auto_type = detect_data_type(selected_file.name, selected_df)
-        data_type_options = ["Battery", "Temperature", "Light", "Other"]
-        default_type = auto_type if auto_type in data_type_options else "Other"
+    st.caption(
+        "Each CSV is analyzed separately. Auto-detection uses the file name and column names. "
+        "You can override the detected data type inside each file section."
+    )
 
-        c1, c2 = st.columns([1, 2])
-        with c1:
-            data_type = st.selectbox(
-                "Choose data type for this CSV",
-                data_type_options,
-                index=data_type_options.index(default_type),
-            )
-        with c2:
-            st.info(f"Auto-detected type: {auto_type}")
+    with st.expander("Data Analysis Settings", expanded=True):
+        col_b1, col_b2, col_b3 = st.columns(3)
 
-        # Settings for the checks.
-        with st.expander("Data Analysis Settings", expanded=True):
-            col_b1, col_b2, col_b3 = st.columns(3)
-            with col_b1:
-                battery_threshold_mv = st.number_input(
-                    "Battery low threshold (mV)",
-                    min_value=0,
-                    max_value=5000,
-                    value=2700,
-                    step=50,
-                )
-            with col_b2:
-                battery_last_n = st.number_input(
-                    "Battery: check last N values",
-                    min_value=1,
-                    max_value=200,
-                    value=20,
-                    step=1,
-                )
-            with col_b3:
-                battery_low_count_limit = st.number_input(
-                    "Battery: allowed low values",
-                    min_value=0,
-                    max_value=20,
-                    value=3,
-                    step=1,
-                )
-
-            col_s1, col_s2, col_s3 = st.columns(3)
-            with col_s1:
-                stuck_run_threshold = st.number_input(
-                    "Stuck-value run threshold",
-                    min_value=2,
-                    max_value=100,
-                    value=4,
-                    step=1,
-                    help="Example: threshold 4 flags values like 23, 23, 23, 23.",
-                )
-            with col_s2:
-                stuck_round_decimals = st.number_input(
-                    "Round decimals for stuck check",
-                    min_value=0,
-                    max_value=6,
-                    value=3,
-                    step=1,
-                )
-            with col_s3:
-                ignore_zero_for_light = st.checkbox(
-                    "Ignore 0 for light stuck check",
-                    value=True,
-                    help="Useful because light can stay exactly 0 during the night.",
-                )
-
-        ts_col = _detect_timestamp_column(selected_df)
-        wide_selected = _to_wide_timeseries(selected_df, ts_col, data_type=data_type)
-
-        m1, m2, m3, m4 = st.columns(4)
-        with m1:
-            st.metric("Rows", len(selected_df))
-        with m2:
-            st.metric("Sensors", len(wide_selected.columns))
-        with m3:
-            st.metric("Start", f"{wide_selected.index.min():%Y-%m-%d %H:%M}")
-        with m4:
-            st.metric("End", f"{wide_selected.index.max():%Y-%m-%d %H:%M}")
-
-        if data_type == "Other":
-            st.warning(
-                "Choose Battery, Temperature, or Light to run automatic checks. "
-                "This file can still be viewed in the preview below."
-            )
-            with st.expander("Preview wide data"):
-                st.dataframe(wide_selected.head(100), use_container_width=True)
-            st.stop()
-
-        result_df = run_data_health_check(
-            selected_df,
-            data_type=data_type,
-            battery_threshold_mv=float(battery_threshold_mv),
-            battery_last_n=int(battery_last_n),
-            battery_low_count_limit=int(battery_low_count_limit),
-            stuck_run_threshold=int(stuck_run_threshold),
-            stuck_round_decimals=int(stuck_round_decimals),
-            ignore_zero_for_light=bool(ignore_zero_for_light),
-        )
-
-        issue_df = result_df[result_df["status"] != "OK"].copy()
-
-        st.markdown("---")
-        st.markdown("### Sensor Health Results")
-
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.metric("Sensors checked", len(result_df))
-        with c2:
-            st.metric("Sensors with issues", len(issue_df))
-        with c3:
-            st.metric("OK sensors", int((result_df["status"] == "OK").sum()))
-
-        if issue_df.empty:
-            st.success("✅ No data issues detected for the selected rules.")
-        else:
-            st.error(f"🚨 {len(issue_df)} sensor(s) have data issues.")
-            st.dataframe(issue_df, hide_index=True, use_container_width=True)
-
-        with st.expander("Show full health-check table", expanded=issue_df.empty):
-            st.dataframe(result_df, hide_index=True, use_container_width=True)
-
-        # Plot selected sensors.
-        st.markdown("---")
-        st.markdown("### Plot Last Values")
-
-        if not issue_df.empty:
-            default_plot_sensors = issue_df["sensor"].astype(str).head(10).tolist()
-        else:
-            default_plot_sensors = [str(c) for c in wide_selected.columns[:10]]
-
-        plot_sensors = st.multiselect(
-            "Choose sensors to plot",
-            [str(c) for c in wide_selected.columns],
-            default=default_plot_sensors,
-        )
-
-        # Convert columns to string only for plotting selection compatibility.
-        wide_for_plot = wide_selected.copy()
-        wide_for_plot.columns = wide_for_plot.columns.astype(str)
-
-        if plot_sensors:
-            fig_last = plot_last_values_for_sensors(
-                wide_for_plot,
-                sensors=plot_sensors,
-                title=f"Last values - {data_type}",
-                last_n=int(battery_last_n) if data_type == "Battery" else 100,
+        with col_b1:
+            battery_threshold_mv = st.number_input(
+                "Battery low threshold (mV)",
+                min_value=0,
+                max_value=5000,
+                value=DEFAULT_BATTERY_LOW_MV,
+                step=50,
             )
 
-            # Add battery threshold line when relevant.
-            if data_type == "Battery":
-                fig_last.add_hline(
-                    y=float(battery_threshold_mv),
-                    line_dash="dash",
-                    annotation_text=f"Low threshold: {battery_threshold_mv:.0f} mV",
+        with col_b2:
+            battery_last_n = st.number_input(
+                "Battery: check last N values",
+                min_value=1,
+                max_value=200,
+                value=DEFAULT_BATTERY_LAST_N,
+                step=1,
+            )
+
+        with col_b3:
+            battery_low_count_limit = st.number_input(
+                "Battery: allowed low values",
+                min_value=0,
+                max_value=20,
+                value=DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
+                step=1,
+            )
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+
+        with col_s1:
+            stuck_run_threshold = st.number_input(
+                "Stuck-value run threshold",
+                min_value=2,
+                max_value=100,
+                value=DEFAULT_STUCK_RUN_THRESHOLD,
+                step=1,
+                help="Example: threshold 4 flags values like 23, 23, 23, 23.",
+            )
+
+        with col_s2:
+            stuck_round_decimals = st.number_input(
+                "Round decimals for stuck check",
+                min_value=0,
+                max_value=6,
+                value=DEFAULT_STUCK_ROUND_DECIMALS,
+                step=1,
+            )
+
+        with col_s3:
+            ignore_zero_for_light = st.checkbox(
+                "Ignore 0 for light stuck check",
+                value=DEFAULT_IGNORE_ZERO_FOR_LIGHT,
+                help="Useful because light can stay exactly 0 during the night.",
+            )
+
+    # Analyze each uploaded file.
+    for file_index, file in enumerate(uploaded_files, start=1):
+        try:
+            raw = read_uploaded_csv(file)
+            auto_type = detect_data_type(file.name, raw)
+            data_type_options = ["Battery", "Temperature", "Light", "Other"]
+            default_type = auto_type if auto_type in data_type_options else "Other"
+
+            with st.expander(f"{file_index}. {file.name}  |  Auto type: {auto_type}", expanded=(file_index == 1)):
+                data_type = st.selectbox(
+                    "Data type for this CSV",
+                    data_type_options,
+                    index=data_type_options.index(default_type),
+                    key=f"data_type_{file_index}_{file.name}",
                 )
 
-            st.plotly_chart(fig_last, use_container_width=True)
+                ts_col = _detect_timestamp_column(raw)
+                wide_selected = _to_wide_timeseries(raw, ts_col, data_type=data_type)
 
-        with st.expander("Preview wide data"):
-            st.dataframe(wide_selected.head(100), use_container_width=True)
+                m1, m2, m3, m4 = st.columns(4)
 
-    except Exception as e:
-        st.error(f"Error processing data analysis: {e}")
+                with m1:
+                    st.metric("Rows", len(raw))
+
+                with m2:
+                    st.metric("Sensors", len(wide_selected.columns))
+
+                with m3:
+                    st.metric("Start", f"{wide_selected.index.min():%Y-%m-%d %H:%M}")
+
+                with m4:
+                    st.metric("End", f"{wide_selected.index.max():%Y-%m-%d %H:%M}")
+
+                if data_type == "Other":
+                    st.warning("Choose Battery, Temperature, or Light to run automatic checks for this CSV.")
+                    with st.expander("Preview wide data"):
+                        st.dataframe(wide_selected.head(100), use_container_width=True)
+                    continue
+
+                result_df = run_data_health_check(
+                    raw,
+                    data_type=data_type,
+                    battery_threshold_mv=float(battery_threshold_mv),
+                    battery_last_n=int(battery_last_n),
+                    battery_low_count_limit=int(battery_low_count_limit),
+                    stuck_run_threshold=int(stuck_run_threshold),
+                    stuck_round_decimals=int(stuck_round_decimals),
+                    ignore_zero_for_light=bool(ignore_zero_for_light),
+                )
+
+                issue_df = result_issues_only(result_df)
+
+                st.markdown("### Sensor Health Results")
+
+                c1, c2, c3 = st.columns(3)
+
+                with c1:
+                    st.metric("Sensors checked", len(result_df))
+
+                with c2:
+                    st.metric("Sensors with issues", len(issue_df))
+
+                with c3:
+                    st.metric("OK sensors", int(len(result_df) - len(issue_df)))
+
+                if issue_df.empty:
+                    st.success("✅ No data issues detected for this CSV.")
+                else:
+                    st.error(f"🚨 {len(issue_df)} sensor(s) have data issues.")
+                    st.dataframe(issue_df, hide_index=True, use_container_width=True)
+
+                with st.expander("Show full health-check table", expanded=issue_df.empty):
+                    st.dataframe(result_df, hide_index=True, use_container_width=True)
+
+                st.markdown("### Plot Last Values")
+
+                if not issue_df.empty:
+                    default_plot_sensors = issue_df["sensor"].astype(str).head(10).tolist()
+                else:
+                    default_plot_sensors = [str(c) for c in wide_selected.columns[:10]]
+
+                wide_for_plot = wide_selected.copy()
+                wide_for_plot.columns = wide_for_plot.columns.astype(str)
+
+                plot_sensors = st.multiselect(
+                    "Choose sensors to plot",
+                    [str(c) for c in wide_for_plot.columns],
+                    default=default_plot_sensors,
+                    key=f"plot_sensors_{file_index}_{file.name}",
+                )
+
+                if plot_sensors:
+                    fig_last = plot_last_values_for_sensors(
+                        wide_for_plot,
+                        sensors=plot_sensors,
+                        title=f"Last values - {data_type} - {file.name}",
+                        last_n=int(battery_last_n) if data_type == "Battery" else 100,
+                    )
+
+                    if data_type == "Battery":
+                        fig_last.add_hline(
+                            y=float(battery_threshold_mv),
+                            line_dash="dash",
+                            annotation_text=f"Low threshold: {battery_threshold_mv:.0f} mV",
+                        )
+
+                    st.plotly_chart(fig_last, use_container_width=True)
+
+                with st.expander("Preview wide data"):
+                    st.dataframe(wide_selected.head(100), use_container_width=True)
+
+        except Exception as e:
+            st.error(f"Error processing {file.name}: {e}")
