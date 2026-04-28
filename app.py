@@ -1232,24 +1232,19 @@ with tab_packet_loss:
             "Hourly plot type",
             ["Overall + Raw Sensor Points", "Specific Sensors"],
             horizontal=True,
+            index=0,
+            key="packet_hourly_plot_type",
         )
 
-        if plot_type == "Overall + Raw Sensor Points":
-            show_raw_points = st.checkbox("Display raw sensor points", value=True)
-
-            fig_hourly = plot_hourly_loss_combined(
-                packet_rep,
-                show_raw_points=show_raw_points,
-                show_specific_sensors=False,
-                selected_sensors=None,
-            )
-            st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_overall_raw")
-
-        else:
+        # IMPORTANT:
+        # The sensor multiselect is intentionally created ONLY inside this
+        # Specific Sensors branch. It will not appear for the Overall + Raw plot.
+        if plot_type == "Specific Sensors":
             sensor_list = packet_rep["hourly_sensor_loss"].columns.tolist()
+
             selected_sensors = st.multiselect(
                 "Select sensors to display:",
-                sensor_list,
+                options=sensor_list,
                 default=sensor_list,
                 key="packet_specific_sensor_selector",
             )
@@ -1259,9 +1254,32 @@ with tab_packet_loss:
                     packet_rep,
                     selected_sensors=selected_sensors,
                 )
-                st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_specific_sensors")
+                st.plotly_chart(
+                    fig_hourly,
+                    use_container_width=True,
+                    key="packet_hourly_loss_specific_sensors",
+                )
             else:
                 st.info("Select at least one sensor to display the specific-sensors plot.")
+
+        else:
+            show_raw_points = st.checkbox(
+                "Display raw sensor points",
+                value=True,
+                key="packet_show_raw_points",
+            )
+
+            fig_hourly = plot_hourly_loss_combined(
+                packet_rep,
+                show_raw_points=show_raw_points,
+                show_specific_sensors=False,
+                selected_sensors=None,
+            )
+            st.plotly_chart(
+                fig_hourly,
+                use_container_width=True,
+                key="packet_hourly_loss_overall_raw",
+            )
 
         st.markdown("---")
         st.markdown("### Distribution of Sensor Packet Loss (%)")
