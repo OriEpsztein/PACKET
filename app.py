@@ -1195,9 +1195,7 @@ with tab_packet_loss:
     if packet_error is not None:
         st.error(f"Error processing packet-loss analysis: {packet_error}")
     else:
-        st.caption("Sampling interval is fixed at 3 minutes. Partial hours are included and calculated by their actual expected timestamp count.")
-
-        st.markdown("### High Packet Loss Alert")
+        # High packet-loss table / message. No separate title here, to keep the tab cleaner.
 
         high_loss_df = packet_sensor_loss_df[
             packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT
@@ -1225,8 +1223,14 @@ with tab_packet_loss:
             )
 
         st.markdown("---")
-        st.markdown("### Hourly Packet Loss")
-        st.info("🕒 Data is grouped by hour. If the first/last hour is partial, expected packets are calculated only for the timestamps that should exist in that partial hour.")
+        st.subheader(
+            "Hourly Packet Loss",
+            help=(
+                "Data is grouped by hour. If the first/last hour is partial, "
+                "expected packets are calculated only for the timestamps that should exist "
+                "in that partial hour."
+            ),
+        )
 
         plot_type = st.radio(
             "Hourly plot type",
