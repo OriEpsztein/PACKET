@@ -512,8 +512,50 @@ def plot_hourly_loss_combined(
         xaxis_title="Hour Start Time",
         yaxis_title="Packet Loss (%)",
         margin=dict(t=55, b=90),
-        yaxis=dict(range=[0, 100]),
+        yaxis=dict(rangemode="tozero"),
         hovermode="closest" if (show_raw_points or show_specific_sensors) else "x unified",
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
+    )
+
+    fig.update_xaxes(type="date", automargin=True)
+
+    return fig
+
+
+def plot_hourly_specific_sensors(
+    rep: dict,
+    selected_sensors: list,
+) -> go.Figure:
+    """Hourly packet-loss plot for selected sensors only."""
+    loss_mat = rep["hourly_sensor_loss"]
+    hours_index = pd.to_datetime(loss_mat.index)
+
+    fig = go.Figure()
+
+    for sensor in selected_sensors:
+        if sensor not in loss_mat.columns:
+            continue
+
+        fig.add_trace(go.Scatter(
+            x=hours_index,
+            y=loss_mat[sensor].to_numpy(dtype=float),
+            mode="lines+markers",
+            name=f"Sensor {sensor}",
+            hovertemplate=(
+                "Hour: %{x|%Y-%m-%d %H:00}<br>"
+                "Sensor " + str(sensor) + "<br>"
+                "Packet Loss (%)=%{y:.2f}<extra></extra>"
+            ),
+        ))
+
+    fig.update_layout(
+        template="plotly_white",
+        title="Hourly Packet Loss - Specific Sensors",
+        xaxis_title="Hour Start Time",
+        yaxis_title="Packet Loss (%)",
+        margin=dict(t=55, b=90),
+        yaxis=dict(rangemode="tozero"),
+        hovermode="x unified",
         legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5),
     )
 
@@ -886,22 +928,6 @@ if not uploaded_files:
 packet_loss_file = uploaded_files[0]
 packet_loss_df = read_uploaded_csv(packet_loss_file)
 
-# Sidebar display only: uploaded files + range.
-st.sidebar.markdown("---")
-st.sidebar.markdown("**Uploaded files:**")
-
-for i, file in enumerate(uploaded_files, start=1):
-    try:
-        info = get_basic_file_info(file)
-        st.sidebar.caption(
-            f"{i}. {file.name}\n\n"
-            f"{info['start']:%Y-%m-%d %H:%M} → {info['end']:%Y-%m-%d %H:%M}\n\n"
-            f"Sensors: {info['sensors']} | Type: {info['auto_type']}"
-        )
-    except Exception as e:
-        st.sidebar.caption(f"{i}. {file.name} - could not read info: {e}")
-
-
 # =========================================================
 # 8) Pre-compute packet loss for the first CSV
 # =========================================================
@@ -1035,13 +1061,6 @@ with tab_summary:
 
     with c4:
         st.metric("Value issue sensors", total_value_issues)
-
-    # -----------------------------------------------------
-    # Uploaded files table
-    # -----------------------------------------------------
-    st.markdown("---")
-    st.markdown("### Uploaded CSVs")
-    st.dataframe(summary_files_df, hide_index=True, use_container_width=True)
 
     # -----------------------------------------------------
     # Distribution chart
@@ -1195,31 +1214,41 @@ with tab_packet_loss:
         st.markdown("### Hourly Packet Loss")
         st.info("🕒 Data is grouped by hour. If the first/last hour is partial, expected packets are calculated only for the timestamps that should exist in that partial hour.")
 
-        col1, col2 = st.columns(2)
+        plot_type = st.radio(
+            "Hourly plot type",
+            ["Overall + Raw Sensor Points", "Specific Sensors"],
+            horizontal=True,
+        )
 
-        with col1:
-            show_raw_points = st.checkbox("Display raw sensor points", value=False)
+        if plot_type == "Overall + Raw Sensor Points":
+            show_raw_points = st.checkbox("Display raw sensor points", value=True)
 
-        with col2:
-            show_specific_sensors = st.checkbox("Display specific sensors", value=False)
+            fig_hourly = plot_hourly_loss_combined(
+                packet_rep,
+                show_raw_points=show_raw_points,
+                show_specific_sensors=False,
+                selected_sensors=None,
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_overall_raw")
 
-        selected_sensors = []
-        if show_specific_sensors:
+        else:
             sensor_list = packet_rep["hourly_sensor_loss"].columns.tolist()
             default_sensor_selection = sensor_list[: min(10, len(sensor_list))]
             selected_sensors = st.multiselect(
                 "Select sensors to display:",
                 sensor_list,
                 default=default_sensor_selection,
+                key="packet_specific_sensor_selector",
             )
 
-        fig_hourly = plot_hourly_loss_combined(
-            packet_rep,
-            show_raw_points=show_raw_points,
-            show_specific_sensors=show_specific_sensors,
-            selected_sensors=selected_sensors,
-        )
-        st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_combined")
+            if selected_sensors:
+                fig_hourly = plot_hourly_specific_sensors(
+                    packet_rep,
+                    selected_sensors=selected_sensors,
+                )
+                st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_specific_sensors")
+            else:
+                st.info("Select at least one sensor to display the specific-sensors plot.")
 
         st.markdown("---")
         st.markdown("### Distribution of Sensor Packet Loss (%)")
@@ -1246,6 +1275,14 @@ with tab_data_analysis:
     st.caption(
         "Each CSV is analyzed separately. Auto-detection uses the file name and column names. "
         "You can override the detected data type inside each file section."
+    )
+
+    st.info(
+        "**How stuck values are checked:** for each sensor, the app sorts values by timestamp, "
+        "rounds values to the selected decimal count, and looks for the longest consecutive run "
+        "of the exact same value. Example: `23, 23, 23, 23` is a stuck run of 4. "
+        "If the run length is equal to or above the threshold, the sensor is flagged. "
+        "For light, `0` is ignored by default because night values can stay at 0 naturally."
     )
 
     with st.expander("Data Analysis Settings", expanded=True):
