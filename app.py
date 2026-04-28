@@ -1038,7 +1038,11 @@ with tab_summary:
         st.error(f"Could not calculate packet loss from the first CSV: {packet_error}")
     else:
         st.caption(f"Packet loss is calculated from the first uploaded CSV: **{packet_loss_file.name}**")
-        st.plotly_chart(plot_sensor_loss_distribution(packet_sensor_loss_df), use_container_width=True)
+        st.plotly_chart(
+            plot_sensor_loss_distribution(packet_sensor_loss_df),
+            use_container_width=True,
+            key="summary_packet_loss_distribution",
+        )
 
     st.markdown("---")
     st.markdown("### Sensors With Problems")
@@ -1139,11 +1143,15 @@ with tab_packet_loss:
             show_specific_sensors=show_specific_sensors,
             selected_sensors=selected_sensors,
         )
-        st.plotly_chart(fig_hourly, use_container_width=True)
+        st.plotly_chart(fig_hourly, use_container_width=True, key="packet_hourly_loss_combined")
 
         st.markdown("---")
         st.markdown("### Distribution of Sensor Packet Loss (%)")
-        st.plotly_chart(plot_sensor_loss_distribution(packet_sensor_loss_df), use_container_width=True)
+        st.plotly_chart(
+            plot_sensor_loss_distribution(packet_sensor_loss_df),
+            use_container_width=True,
+            key="packet_sensor_loss_distribution",
+        )
 
         with st.expander("Show full sensor packet-loss table"):
             st.dataframe(
@@ -1328,7 +1336,7 @@ with tab_data_analysis:
                             annotation_text=f"Low threshold: {battery_threshold_mv:.0f} mV",
                         )
 
-                    st.plotly_chart(fig_last, use_container_width=True)
+                    st.plotly_chart(fig_last, use_container_width=True, key=f"last_values_plot_{file_index}")
 
                 with st.expander("Preview wide data"):
                     st.dataframe(wide_selected.head(100), use_container_width=True)
