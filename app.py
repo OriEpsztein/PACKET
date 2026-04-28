@@ -939,6 +939,27 @@ if not uploaded_files:
     st.info("Upload one or more CSV files from the left sidebar to begin analysis.")
     st.stop()
 
+# Show each uploaded CSV name and its min/max timestamp in the left sidebar.
+# There is still NO selector here: packet loss always uses the first uploaded CSV.
+st.sidebar.markdown("---")
+st.sidebar.subheader("CSV Time Ranges")
+
+for sidebar_i, sidebar_file in enumerate(uploaded_files, start=1):
+    try:
+        sidebar_info = get_basic_file_info(sidebar_file)
+        sidebar_start = sidebar_info["start"]
+        sidebar_end = sidebar_info["end"]
+
+        st.sidebar.markdown(f"**{sidebar_i}. {sidebar_file.name}**")
+        st.sidebar.caption(
+            f"Min: {sidebar_start:%Y-%m-%d %H:%M}  \n"
+            f"Max: {sidebar_end:%Y-%m-%d %H:%M}"
+        )
+
+    except Exception as sidebar_e:
+        st.sidebar.markdown(f"**{sidebar_i}. {sidebar_file.name}**")
+        st.sidebar.caption(f"Could not read time range: {sidebar_e}")
+
 # No sidebar file selector: packet loss always uses the first CSV.
 packet_loss_file = uploaded_files[0]
 packet_loss_df = read_uploaded_csv(packet_loss_file)
@@ -1053,11 +1074,25 @@ with tab_summary:
     # Top-level summary cards
     # -----------------------------------------------------
     sensors_above_5_count = 0 if packet_problem_df.empty else len(packet_problem_df)
-    total_value_issues = int(
-        pd.to_numeric(summary_files_df["value_issues_count"], errors="coerce")
-        .fillna(0)
-        .sum()
-    )
+
+    # Count unique sensor problems across files.
+    # Example: same sensor in two different CSVs is counted separately because
+    # it is a separate file/problem context.
+    if summary_value_issues_df.empty:
+        low_battery_sensor_count = 0
+        value_problem_sensor_count = 0
+    else:
+        unique_value_problem_sensors = summary_value_issues_df.drop_duplicates(
+            subset=["file", "data_type", "sensor"]
+        )
+        value_problem_sensor_count = len(unique_value_problem_sensors)
+
+        low_battery_sensor_count = len(
+            summary_value_issues_df[
+                (summary_value_issues_df["data_type"] == "Battery")
+                & (summary_value_issues_df["issue"].astype(str).str.contains("LOW_BATTERY", na=False))
+            ].drop_duplicates(subset=["file", "sensor"])
+        )
 
     c1, c2, c3, c4 = st.columns(4)
 
@@ -1065,16 +1100,16 @@ with tab_summary:
         st.metric("Uploaded files", len(uploaded_files))
 
     with c2:
-        st.metric("Packet-loss CSV", packet_loss_file.name)
+        if packet_error is not None:
+            st.metric("Sensors > 5% packet loss", "-")
+        else:
+            st.metric("Sensors > 5% packet loss", sensors_above_5_count)
 
     with c3:
-        if packet_error is not None:
-            st.metric("Sensors > 5% loss", "-")
-        else:
-            st.metric("Sensors > 5% loss", sensors_above_5_count)
+        st.metric("Low battery sensors", low_battery_sensor_count)
 
     with c4:
-        st.metric("Value issue sensors", total_value_issues)
+        st.metric("Sensors with value problem", value_problem_sensor_count)
 
     # -----------------------------------------------------
     # Distribution chart
