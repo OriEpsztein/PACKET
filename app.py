@@ -1009,6 +1009,16 @@ tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
 with tab_summary:
     st.subheader("Summary")
 
+    # -----------------------------------------------------
+    # Top-level summary cards
+    # -----------------------------------------------------
+    sensors_above_5_count = 0 if packet_problem_df.empty else len(packet_problem_df)
+    total_value_issues = int(
+        pd.to_numeric(summary_files_df["value_issues_count"], errors="coerce")
+        .fillna(0)
+        .sum()
+    )
+
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
@@ -1018,19 +1028,24 @@ with tab_summary:
         st.metric("Packet-loss CSV", packet_loss_file.name)
 
     with c3:
-        if packet_sensor_loss_df.empty:
+        if packet_error is not None:
             st.metric("Sensors > 5% loss", "-")
         else:
-            st.metric("Sensors > 5% loss", int((packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT).sum()))
+            st.metric("Sensors > 5% loss", sensors_above_5_count)
 
     with c4:
-        total_value_issues = int(pd.to_numeric(summary_files_df["value_issues_count"], errors="coerce").fillna(0).sum())
         st.metric("Value issue sensors", total_value_issues)
 
+    # -----------------------------------------------------
+    # Uploaded files table
+    # -----------------------------------------------------
     st.markdown("---")
     st.markdown("### Uploaded CSVs")
     st.dataframe(summary_files_df, hide_index=True, use_container_width=True)
 
+    # -----------------------------------------------------
+    # Distribution chart
+    # -----------------------------------------------------
     st.markdown("---")
     st.markdown("### Distribution of Sensor Packet Loss (%)")
 
@@ -1044,37 +1059,98 @@ with tab_summary:
             key="summary_packet_loss_distribution",
         )
 
+    # -----------------------------------------------------
+    # Sensors above 5% packet loss: number + names
+    # -----------------------------------------------------
     st.markdown("---")
-    st.markdown("### Sensors With Problems")
+    st.markdown("### Sensors > 5% Packet Loss")
 
-    problem_rows = []
-
-    if not packet_problem_df.empty:
-        for _, r in packet_problem_df.iterrows():
-            problem_rows.append({
-                "problem_type": "PACKET_LOSS_>5%",
-                "file": packet_loss_file.name,
-                "data_type": "Packet Loss",
-                "sensor": r["sensor"],
-                "issue": f"Packet loss above {PACKET_LOSS_ALERT_PCT:.0f}%",
-                "loss_pct": float(r["loss_pct"]),
-                "details": f"lost_packets={int(r['lost_packets'])} | expected_packets={int(r['expected_packets'])} | received_packets={int(r['packets_received'])}",
-            })
-
-    if not summary_value_issues_df.empty:
-        problem_rows.extend(summary_value_issues_df.to_dict("records"))
-
-    all_problem_df = pd.DataFrame(problem_rows)
-
-    if all_problem_df.empty:
-        st.success("✅ No problematic sensors found: no sensors above 5% packet loss and no value issues detected.")
+    if packet_error is not None:
+        st.warning("Packet-loss sensors could not be listed because packet-loss calculation failed.")
+    elif packet_problem_df.empty:
+        st.success("✅ 0 sensors above 5% packet loss.")
     else:
-        st.error(f"🚨 {len(all_problem_df)} problem row(s) found.")
+        problem_names = packet_problem_df["sensor"].astype(str).tolist()
+
+        st.error(f"🚨 {len(problem_names)} sensor(s) above 5% packet loss.")
+        st.markdown("**Sensor names:**")
+        st.write(", ".join(problem_names))
+
+        packet_summary_display = (
+            packet_problem_df[[
+                "sensor", "loss_pct", "lost_packets", "expected_packets", "packets_received"
+            ]]
+            .sort_values("loss_pct", ascending=False)
+            .rename(columns={
+                "sensor": "Sensor",
+                "loss_pct": "Loss (%)",
+                "lost_packets": "Lost Packets",
+                "expected_packets": "Expected Packets",
+                "packets_received": "Received Packets",
+            })
+        )
+
         st.dataframe(
-            all_problem_df.style.format({"loss_pct": "{:.2f}"}),
+            packet_summary_display.style.format({"Loss (%)": "{:.2f}%"}),
             hide_index=True,
             use_container_width=True,
         )
+
+    # -----------------------------------------------------
+    # Value issue sensors: sensor + issue
+    # -----------------------------------------------------
+    st.markdown("---")
+    st.markdown("### Value Issue Sensors")
+
+    if summary_value_issues_df.empty:
+        st.success("✅ No battery / temperature / light value issues detected.")
+    else:
+        value_issue_display = (
+            summary_value_issues_df[["file", "data_type", "sensor", "issue", "details"]]
+            .rename(columns={
+                "file": "File",
+                "data_type": "Data Type",
+                "sensor": "Sensor",
+                "issue": "Issue",
+                "details": "Details",
+            })
+            .sort_values(["Data Type", "Sensor"])
+        )
+
+        st.error(f"🚨 {len(value_issue_display)} value issue sensor row(s) found.")
+        st.dataframe(value_issue_display, hide_index=True, use_container_width=True)
+
+    # -----------------------------------------------------
+    # Optional combined problem table for quick export / debugging
+    # -----------------------------------------------------
+    with st.expander("Show combined problem table"):
+        problem_rows = []
+
+        if not packet_problem_df.empty:
+            for _, r in packet_problem_df.iterrows():
+                problem_rows.append({
+                    "problem_type": "PACKET_LOSS_>5%",
+                    "file": packet_loss_file.name,
+                    "data_type": "Packet Loss",
+                    "sensor": r["sensor"],
+                    "issue": f"Packet loss above {PACKET_LOSS_ALERT_PCT:.0f}%",
+                    "loss_pct": float(r["loss_pct"]),
+                    "details": f"lost_packets={int(r['lost_packets'])} | expected_packets={int(r['expected_packets'])} | received_packets={int(r['packets_received'])}",
+                })
+
+        if not summary_value_issues_df.empty:
+            problem_rows.extend(summary_value_issues_df.to_dict("records"))
+
+        all_problem_df = pd.DataFrame(problem_rows)
+
+        if all_problem_df.empty:
+            st.success("No problematic sensors found.")
+        else:
+            st.dataframe(
+                all_problem_df.style.format({"loss_pct": "{:.2f}"}),
+                hide_index=True,
+                use_container_width=True,
+            )
 
 
 # =========================================================
