@@ -1,4 +1,7 @@
 import io
+import os
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -33,8 +36,20 @@ BATTERY_REPLACE_CONSECUTIVE_LOW = 6
 BATTERY_POSSIBLE_LOW_COUNT = 3
 BATTERY_REPLACE_LOW_PCT = 20.0
 
-DEFAULT_STUCK_RUN_THRESHOLD = 4
-DEFAULT_STUCK_ROUND_DECIMALS = 2
+# Severity colors. The severity boundaries themselves are calculated
+# adaptively from the uploaded experiment data; they are not fixed percentages.
+SEVERITY_COLORS = {
+    "LOW": "#F2C94C",
+    "MEDIUM": "#F2994A",
+    "HIGH": "#EB5757",
+}
+
+BATTERY_STATUS_COLORS = {
+    "LIMITED BATTERY DATA": "#F2C94C",
+    "INSUFFICIENT BATTERY DATA": "#D4A72C",
+    "POSSIBLE BATTERY ISSUE": "#F2994A",
+    "REPLACE BATTERY": "#EB5757",
+}
 
 
 # =========================================================
@@ -120,6 +135,229 @@ def detect_data_type(file_name: str, df: pd.DataFrame = None) -> str:
     return "Other"
 
 
+def infer_experiment_name(files) -> str:
+    """Infer the experiment name from filenames.
+
+    Examples:
+        Morris_Grape_April26_battery_2026-09-03.csv
+        Morris_Grape_April26_hdc_temp_2026-09-03.csv
+
+    Both become:
+        Morris_Grape_April26
+
+    The experiment name is everything before the parameter/type token.
+    """
+    if not files:
+        return "Unknown"
+
+    # Multi-token parameter names must be checked before generic "temp".
+    parameter_patterns = [
+        r"[_\- ]hdc[_\- ]temp(?=[_\- ]|$)",
+        r"[_\- ]temperature(?=[_\- ]|$)",
+        r"[_\- ]battery(?=[_\- ]|$)",
+        r"[_\- ]batt(?=[_\- ]|$)",
+        r"[_\- ]light(?=[_\- ]|$)",
+        r"[_\- ]radiation(?=[_\- ]|$)",
+        r"[_\- ]lux(?=[_\- ]|$)",
+        r"[_\- ]par(?=[_\- ]|$)",
+        r"[_\- ]temp(?=[_\- ]|$)",
+    ]
+
+    candidates = []
+
+    for file in files:
+        stem = os.path.splitext(str(file.name))[0]
+        lower = stem.lower()
+
+        matches = []
+        for pattern in parameter_patterns:
+            match = re.search(pattern, lower)
+            if match:
+                matches.append(match.start())
+
+        if matches:
+            stem = stem[:min(matches)]
+
+        candidates.append(stem.rstrip("_- "))
+
+    if len(set(candidates)) == 1:
+        return candidates[0] or "Unknown"
+
+    common = os.path.commonprefix(candidates).rstrip("_- ")
+    return common if len(common) >= 3 else candidates[0]
+
+
+def _adaptive_cluster_severity(values: pd.Series) -> pd.Series:
+    """Split problem values into Low / Medium / High using the data itself.
+
+    This is a deterministic 1-D clustering approach:
+    - no fixed percentage boundaries are used;
+    - one unique problem level -> Medium;
+    - two unique levels -> Low / High;
+    - three or more levels -> up to three natural clusters, ordered by centroid.
+
+    The output index matches the input index.
+    """
+    s = pd.to_numeric(values, errors="coerce")
+    valid = s.dropna()
+
+    result = pd.Series(index=s.index, dtype="object")
+    if valid.empty:
+        return result
+
+    unique_values = np.sort(valid.unique())
+
+    if len(unique_values) == 1:
+        result.loc[valid.index] = "MEDIUM"
+        return result
+
+    if len(unique_values) == 2:
+        low_value, high_value = unique_values[0], unique_values[-1]
+        result.loc[valid.index] = np.where(valid <= low_value, "LOW", "HIGH")
+        return result
+
+    k = 3
+
+    # Quantile-based deterministic starting centers.
+    centers = np.quantile(valid.to_numpy(dtype=float), [0.15, 0.50, 0.85]).astype(float)
+
+    for _ in range(100):
+        vals = valid.to_numpy(dtype=float)
+        distances = np.abs(vals[:, None] - centers[None, :])
+        labels = distances.argmin(axis=1)
+
+        new_centers = centers.copy()
+        for cluster_i in range(k):
+            cluster_vals = vals[labels == cluster_i]
+            if len(cluster_vals):
+                new_centers[cluster_i] = cluster_vals.mean()
+
+        if np.allclose(new_centers, centers, rtol=0, atol=1e-10):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    # Recalculate final labels and order clusters from lowest to highest centroid.
+    vals = valid.to_numpy(dtype=float)
+    labels = np.abs(vals[:, None] - centers[None, :]).argmin(axis=1)
+
+    used_clusters = sorted(set(labels.tolist()), key=lambda i: centers[i])
+
+    if len(used_clusters) == 1:
+        cluster_to_severity = {used_clusters[0]: "MEDIUM"}
+    elif len(used_clusters) == 2:
+        cluster_to_severity = {
+            used_clusters[0]: "LOW",
+            used_clusters[1]: "HIGH",
+        }
+    else:
+        cluster_to_severity = {
+            used_clusters[0]: "LOW",
+            used_clusters[1]: "MEDIUM",
+            used_clusters[-1]: "HIGH",
+        }
+
+    result.loc[valid.index] = [
+        cluster_to_severity[int(label)] for label in labels
+    ]
+    return result
+
+
+def add_adaptive_severity(
+    df: pd.DataFrame,
+    value_col: str,
+    severity_col: str = "severity",
+) -> pd.DataFrame:
+    """Return a copy with adaptive Low / Medium / High severity."""
+    out = df.copy()
+    if out.empty:
+        out[severity_col] = pd.Series(dtype="object")
+        return out
+
+    out[severity_col] = _adaptive_cluster_severity(out[value_col])
+    return out
+
+
+def normalized_severity(priority: str) -> str:
+    """Map health-check priority labels to LOW / MEDIUM / HIGH."""
+    value = str(priority).upper()
+    if value == "HIGH":
+        return "HIGH"
+    if value == "MEDIUM":
+        return "MEDIUM"
+    return "LOW"
+
+
+def plot_severity_donut(rows_df: pd.DataFrame, title: str) -> go.Figure:
+    """Compact donut chart split into adaptive Low / Medium / High severity."""
+    order = ["LOW", "MEDIUM", "HIGH"]
+    counts = rows_df["severity"].value_counts() if not rows_df.empty else pd.Series(dtype=int)
+    labels = [level.title() for level in order if int(counts.get(level, 0)) > 0]
+    values = [int(counts.get(level, 0)) for level in order if int(counts.get(level, 0)) > 0]
+    colors = [SEVERITY_COLORS[level] for level in order if int(counts.get(level, 0)) > 0]
+
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.58,
+        marker=dict(colors=colors),
+        textinfo="label+value",
+        hovertemplate="%{label}<br>Sensors=%{value}<br>%{percent}<extra></extra>",
+        sort=False,
+    )])
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(text=title, x=0.5, xanchor="center"),
+        margin=dict(t=55, b=10, l=10, r=10),
+        showlegend=False,
+        height=300,
+    )
+    return fig
+
+
+def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> go.Figure:
+    """Battery donut using the real battery status names."""
+    order = [
+        "LIMITED BATTERY DATA",
+        "INSUFFICIENT BATTERY DATA",
+        "POSSIBLE BATTERY ISSUE",
+        "REPLACE BATTERY",
+    ]
+
+    counts = rows_df["issue"].value_counts() if not rows_df.empty else pd.Series(dtype=int)
+
+    labels = [status for status in order if int(counts.get(status, 0)) > 0]
+    values = [int(counts.get(status, 0)) for status in order if int(counts.get(status, 0)) > 0]
+    colors = [BATTERY_STATUS_COLORS[status] for status in labels]
+
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.58,
+        marker=dict(colors=colors),
+        textinfo="value",
+        hovertemplate="%{label}<br>Sensors=%{value}<br>%{percent}<extra></extra>",
+        sort=False,
+    )])
+
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(text=title, x=0.5, xanchor="center"),
+        margin=dict(t=55, b=65, l=10, r=10),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.02,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=10),
+        ),
+        height=340,
+    )
+    return fig
+
+
 def _value_candidates_for_type(data_type: str) -> list:
     """Preferred value columns for long-format files."""
     if data_type == "Battery":
@@ -197,15 +435,21 @@ def _to_wide_timeseries(df: pd.DataFrame, ts_col: str, data_type: str = None) ->
     # Timestamp | sensor_1 | sensor_2 | sensor_3 | ...
     # -----------------------------------------------------
     if sensor_col is None:
-        wide = df.set_index(ts_col).sort_index()
+        # Keep every sensor column that exists in the CSV, even if that sensor
+        # has no numeric measurements at all. A completely empty sensor is still
+        # part of the experiment and must be counted.
+        sensor_columns = [c for c in df.columns if c != ts_col]
+
+        wide = df.set_index(ts_col)[sensor_columns].sort_index()
         wide = wide.apply(pd.to_numeric, errors="coerce")
-        wide = wide.dropna(axis=1, how="all")
 
-        # If the CSV has duplicate timestamps, average them before reindexing.
+        # If the CSV has duplicate timestamps, average them while preserving
+        # all original sensor columns, including all-NaN columns.
         wide = wide.groupby(wide.index).mean()
+        wide = wide.reindex(columns=sensor_columns)
 
-        if wide.empty:
-            raise ValueError("No usable numeric sensor columns found after parsing.")
+        if len(wide.columns) == 0:
+            raise ValueError("No sensor columns found after parsing.")
 
         return wide
 
@@ -219,26 +463,34 @@ def _to_wide_timeseries(df: pd.DataFrame, ts_col: str, data_type: str = None) ->
         data_type=data_type,
     )
 
+    # Preserve the complete sensor list before dropping invalid measurements.
+    sensor_order = df[sensor_col].dropna().astype(str).drop_duplicates().tolist()
+
     temp = df[[ts_col, sensor_col, value_col]].copy()
+    temp[sensor_col] = temp[sensor_col].astype(str)
     temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce")
-    temp = temp.dropna(subset=[value_col])
+    temp_valid = temp.dropna(subset=[value_col])
 
-    if temp.empty:
-        raise ValueError("No numeric values after parsing the selected value column.")
+    if temp_valid.empty and not sensor_order:
+        raise ValueError("No sensor data found after parsing the selected value column.")
 
-    wide = (
-        temp.pivot_table(
-            index=ts_col,
-            columns=sensor_col,
-            values=value_col,
-            aggfunc="mean",
+    if temp_valid.empty:
+        valid_times = pd.DatetimeIndex(sorted(temp[ts_col].dropna().unique()))
+        wide = pd.DataFrame(index=valid_times, columns=sensor_order, dtype=float)
+    else:
+        wide = (
+            temp_valid.pivot_table(
+                index=ts_col,
+                columns=sensor_col,
+                values=value_col,
+                aggfunc="mean",
+            )
+            .sort_index()
+            .reindex(columns=sensor_order)
         )
-        .sort_index()
-        .dropna(axis=1, how="all")
-    )
 
-    if wide.empty:
-        raise ValueError("No usable sensor columns after pivoting long-format data.")
+    if len(wide.columns) == 0:
+        raise ValueError("No sensor columns found after pivoting long-format data.")
 
     return wide
 
@@ -259,6 +511,54 @@ def get_basic_file_info(uploaded_file) -> dict:
         "auto_type": detect_data_type(uploaded_file.name, raw),
     }
 
+
+
+
+def select_packet_loss_source(uploaded_files):
+    """Choose the best uploaded CSV to estimate packet loss.
+
+    Preference:
+    1. file containing the largest sensor set;
+    2. among those, the highest numeric-data coverage;
+    3. then the largest number of timestamp rows.
+
+    This avoids depending on upload order and reduces false packet loss from a
+    parameter file that has extra value-specific gaps.
+    """
+    candidates = []
+
+    for file in uploaded_files:
+        try:
+            raw = read_uploaded_csv(file)
+            ts_col = _detect_timestamp_column(raw)
+            wide = _to_wide_timeseries(raw, ts_col)
+
+            n_sensors = int(len(wide.columns))
+            n_rows = int(len(wide))
+
+            total_cells = int(wide.shape[0] * wide.shape[1])
+            valid_cells = int(wide.notna().sum().sum())
+            coverage = (valid_cells / total_cells) if total_cells else 0.0
+
+            candidates.append({
+                "file": file,
+                "raw": raw,
+                "n_sensors": n_sensors,
+                "coverage": float(coverage),
+                "n_rows": n_rows,
+            })
+        except Exception:
+            continue
+
+    if not candidates:
+        raise ValueError("Could not find a usable CSV for packet-loss analysis.")
+
+    best = max(
+        candidates,
+        key=lambda x: (x["n_sensors"], x["coverage"], x["n_rows"]),
+    )
+
+    return best["file"], best["raw"], best
 
 # =========================================================
 # 3) Packet-loss computation
@@ -827,6 +1127,7 @@ def analyze_battery(
             "status": status,
             "has_issue": bool(issue),
             "priority": priority,
+            "severity": normalized_severity(priority),
             "recommended_action": recommended_action,
             "why": why,
             "values_checked": n_checked,
@@ -865,138 +1166,113 @@ def analyze_battery(
 
     return out
 
-def longest_equal_run(series: pd.Series, decimals: int = DEFAULT_STUCK_ROUND_DECIMALS, ignore_values: set = None) -> dict:
-    """Find the longest consecutive run of equal values.
-
-    Example: 23, 23, 23, 23 -> run length 4.
-    Rounding helps avoid tiny floating-point differences.
-    """
-    s = pd.to_numeric(series, errors="coerce").dropna().sort_index()
-
-    best_len = 0
-    best_value = np.nan
-    best_start = pd.NaT
-    best_end = pd.NaT
-
-    current_len = 0
-    current_value = None
-    current_start = pd.NaT
-    current_end = pd.NaT
-
-    for timestamp, value in s.items():
-        rounded_value = round(float(value), decimals)
-
-        # Values that should not count as stuck, for example light=0 at night.
-        if ignore_values is not None and rounded_value in ignore_values:
-            current_len = 0
-            current_value = None
-            current_start = pd.NaT
-            current_end = pd.NaT
-            continue
-
-        if current_len == 0 or rounded_value != current_value:
-            current_len = 1
-            current_value = rounded_value
-            current_start = timestamp
-            current_end = timestamp
-        else:
-            current_len += 1
-            current_end = timestamp
-
-        if current_len > best_len:
-            best_len = current_len
-            best_value = current_value
-            best_start = current_start
-            best_end = current_end
-
-    return {
-        "max_stuck_run": int(best_len),
-        "stuck_value": best_value,
-        "stuck_start_time": best_start,
-        "stuck_end_time": best_end,
-    }
-
-
 def analyze_temperature(
     wide: pd.DataFrame,
-    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
-    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
     bad_temp_value: float = -40,
 ) -> pd.DataFrame:
-    """Temperature checks: -40 values and stuck repeated values."""
+    """Temperature health check.
+
+    Rules:
+    - One -40°C reading is enough to mark a sensor as problematic.
+    - A sensor column with zero usable measurements is NO TEMPERATURE DATA.
+    - Severity for -40 problems is adaptive relative to the other problematic
+      temperature sensors in the same uploaded experiment; no fixed percentage
+      boundaries are used.
+    """
     rows = []
 
     for sensor in wide.columns:
         s = pd.to_numeric(wide[sensor], errors="coerce").dropna().sort_index()
 
+        values_count = int(len(s))
+
+        if values_count == 0:
+            rows.append({
+                "sensor": str(sensor),
+                "status": "NO TEMPERATURE DATA",
+                "has_issue": True,
+                "severity": "HIGH",
+                "priority": "HIGH",
+                "recommended_action": "Reset Sensor",
+                "next_action": "Replace Sensor if persists",
+                "why": "The sensor exists in the CSV but has no usable temperature measurements.",
+                "values_count": 0,
+                "minus_40_count": 0,
+                "minus_40_pct": np.nan,
+                "first_minus_40_time": pd.NaT,
+                "last_minus_40_time": pd.NaT,
+                "last_value": np.nan,
+            })
+            continue
+
         bad_temp_mask = s <= (bad_temp_value + 0.1)
         bad_temp_count = int(bad_temp_mask.sum())
-
-        run_info = longest_equal_run(s, decimals=stuck_round_decimals)
-        is_stuck = run_info["max_stuck_run"] >= stuck_run_threshold
-
-        issues = []
-        if bad_temp_count > 0:
-            issues.append("TEMP_-40")
-        if is_stuck:
-            issues.append("STUCK_VALUE")
-
-        has_issue = len(issues) > 0
-        status = "OK" if not has_issue else " / ".join(issues)
+        bad_temp_pct = bad_temp_count / values_count * 100.0
+        has_issue = bad_temp_count > 0
 
         if has_issue:
-            priority = "HIGH" if len(issues) > 1 else "MEDIUM"
+            status = "TEMP_-40"
+            priority = "MEDIUM"  # replaced by adaptive severity below
             recommended_action = "Reset Sensor"
             next_action = "Replace Sensor if persists"
-
-            why_parts = []
-            if bad_temp_count > 0:
-                why_parts.append(f"{bad_temp_count} value(s) at or below {bad_temp_value:.0f}°C")
-            if is_stuck:
-                why_parts.append(
-                    f"same rounded value repeated {run_info['max_stuck_run']} consecutive times"
-                )
-            why = "; ".join(why_parts)
+            why = (
+                f"{bad_temp_count}/{values_count} values ({bad_temp_pct:.2f}%) "
+                f"are at or below {bad_temp_value:.0f}°C."
+            )
+            severity = None
         else:
+            status = "OK"
             priority = "OK"
             recommended_action = "No Action"
             next_action = ""
-            why = "No -40°C values and no stuck-value run detected."
+            why = "No -40°C values detected."
+            severity = "OK"
 
         rows.append({
             "sensor": str(sensor),
             "status": status,
             "has_issue": has_issue,
+            "severity": severity,
             "priority": priority,
             "recommended_action": recommended_action,
             "next_action": next_action,
             "why": why,
-            "values_count": int(len(s)),
+            "values_count": values_count,
             "minus_40_count": bad_temp_count,
+            "minus_40_pct": bad_temp_pct,
             "first_minus_40_time": s[bad_temp_mask].index.min() if bad_temp_count else pd.NaT,
             "last_minus_40_time": s[bad_temp_mask].index.max() if bad_temp_count else pd.NaT,
-            "max_stuck_run": run_info["max_stuck_run"],
-            "stuck_value": run_info["stuck_value"],
-            "stuck_start_time": run_info["stuck_start_time"],
-            "stuck_end_time": run_info["stuck_end_time"],
-            "last_value": float(s.iloc[-1]) if len(s) else np.nan,
+            "last_value": float(s.iloc[-1]),
         })
 
-    return pd.DataFrame(rows).sort_values(
-        by=["has_issue", "minus_40_count", "max_stuck_run"],
-        ascending=[False, False, False],
-    )
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+
+    # Adaptively split only the actual -40 problems.
+    temp_problem_mask = out["status"] == "TEMP_-40"
+    if temp_problem_mask.any():
+        adaptive = _adaptive_cluster_severity(
+            out.loc[temp_problem_mask, "minus_40_pct"]
+        )
+        out.loc[temp_problem_mask, "severity"] = adaptive
+        out.loc[temp_problem_mask, "priority"] = adaptive
+
+    severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "OK": 3}
+    out["_severity_order"] = out["severity"].map(severity_order).fillna(9)
+
+    return out.sort_values(
+        by=["_severity_order", "minus_40_pct", "minus_40_count"],
+        ascending=[True, False, False],
+        na_position="first",
+    ).drop(columns=["_severity_order"])
 
 
 def analyze_light(wide: pd.DataFrame) -> pd.DataFrame:
     """Light check.
 
-    Current requested rule:
-    - Do NOT run stuck-value detection for light.
-    - Stuck-value detection is only for temperature.
-
-    This function still returns a clean per-sensor table so the Light CSV can be
-    previewed in Data Analysis, but it does not mark light sensors as issues.
+    No automatic Light value-health rule is currently enabled.
+    The function returns a clean per-sensor table for preview.
     """
     rows = []
 
@@ -1013,7 +1289,7 @@ def analyze_light(wide: pd.DataFrame) -> pd.DataFrame:
             "why": "No automatic Light value-health rule is currently enabled.",
             "values_count": int(len(s)),
             "last_value": float(s.iloc[-1]) if len(s) else np.nan,
-            "note": "No stuck-value check for Light. Stuck-value check is only for Temperature.",
+            "note": "No automatic Light value-health rule is currently enabled.",
         })
 
     return pd.DataFrame(rows).sort_values(by=["sensor"])
@@ -1024,8 +1300,6 @@ def run_data_health_check(
     data_type: str,
     battery_threshold_mv: float = DEFAULT_BATTERY_LOW_MV,
     battery_last_n: int = DEFAULT_BATTERY_LAST_N,
-    stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
-    stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
 ) -> pd.DataFrame:
     """Run the correct health check according to selected data type."""
     ts_col = _detect_timestamp_column(df)
@@ -1039,11 +1313,7 @@ def run_data_health_check(
         )
 
     if data_type == "Temperature":
-        return analyze_temperature(
-            wide,
-            stuck_run_threshold=stuck_run_threshold,
-            stuck_round_decimals=stuck_round_decimals,
-        )
+        return analyze_temperature(wide)
 
     if data_type == "Light":
         return analyze_light(wide)
@@ -1109,68 +1379,94 @@ def build_issue_time_range(issue_row: pd.Series, data_type: str) -> str:
             if not pd.isna(start) and not pd.isna(end):
                 ranges.append(f"-40: {_fmt_timestamp(start)} → {_fmt_timestamp(end)}")
 
-        if "STUCK_VALUE" in status:
-            start = issue_row.get("stuck_start_time", pd.NaT)
-            end = issue_row.get("stuck_end_time", pd.NaT)
-            if not pd.isna(start) and not pd.isna(end):
-                ranges.append(f"Stuck: {_fmt_timestamp(start)} → {_fmt_timestamp(end)}")
-
         return " | ".join(ranges) if ranges else "-"
 
     return "-"
 
 
 def detect_system_packet_loss(rep: dict, threshold_pct: float = PACKET_LOSS_ALERT_PCT) -> dict:
-    """Detect a likely Pi-level packet-loss event.
+    """Detect a likely Pi/system-level packet-loss pattern adaptively.
 
-    Conservative rule:
-    - at least 3 sensors exist, and
-    - more than half of the sensors exceed the packet-loss threshold
-      in the same hour.
+    The 5% threshold still defines whether an individual sensor has a packet-loss
+    problem. Pi-level detection is different: it compares the number of sensors
+    affected together in each hour with the experiment's own normal pattern.
 
-    This does not prove the Pi is the cause; it is used only to recommend
-    checking/resetting the Pi before touching many individual sensors.
+    A Pi-level recommendation is made when either:
+    - many sensors are persistently affected together relative to experiment size; or
+    - an hour is a statistical high outlier versus the experiment's usual number
+      of simultaneously affected sensors.
+
+    No fixed "50% of sensors" rule is used.
     """
+    empty = {
+        "detected": False,
+        "hour": pd.NaT,
+        "affected": 0,
+        "total": 0,
+        "affected_pct": 0.0,
+        "typical_affected": 0.0,
+        "dynamic_cutoff": np.nan,
+        "mode": "",
+    }
+
     if not rep or rep.get("hourly_sensor_loss") is None:
-        return {
-            "detected": False,
-            "hour": pd.NaT,
-            "affected": 0,
-            "total": 0,
-            "affected_pct": 0.0,
-        }
+        return empty
 
     loss_mat = rep["hourly_sensor_loss"]
     if loss_mat.empty:
-        return {
-            "detected": False,
-            "hour": pd.NaT,
-            "affected": 0,
-            "total": 0,
-            "affected_pct": 0.0,
-        }
+        return empty
 
     total = int(loss_mat.shape[1])
     if total < 3:
-        return {
-            "detected": False,
-            "hour": pd.NaT,
-            "affected": 0,
-            "total": total,
-            "affected_pct": 0.0,
-        }
+        return {**empty, "total": total}
 
-    affected_counts = (loss_mat > threshold_pct).sum(axis=1)
+    affected_counts = (loss_mat > threshold_pct).sum(axis=1).astype(float)
+
     max_hour = affected_counts.idxmax()
     max_affected = int(affected_counts.loc[max_hour])
     affected_pct = max_affected / total * 100.0 if total else 0.0
 
+    typical = float(affected_counts.median())
+    q1 = float(affected_counts.quantile(0.25))
+    q3 = float(affected_counts.quantile(0.75))
+    iqr = q3 - q1
+    dynamic_cutoff = q3 + 1.5 * iqr
+
+    # Experiment-size-aware minimum simultaneous group.
+    # For 64 sensors this is 8; for 25 sensors it is 5.
+    meaningful_group = max(3, int(np.ceil(np.sqrt(total))))
+
+    persistent_system_pattern = typical >= meaningful_group
+
+    if iqr > 0:
+        spike_pattern = (
+            max_affected >= meaningful_group
+            and max_affected > dynamic_cutoff
+        )
+    else:
+        spike_pattern = (
+            max_affected >= meaningful_group
+            and max_affected > typical
+        )
+
+    detected = bool(persistent_system_pattern or spike_pattern)
+
+    if persistent_system_pattern:
+        mode = "persistent common pattern"
+    elif spike_pattern:
+        mode = "simultaneous spike"
+    else:
+        mode = ""
+
     return {
-        "detected": bool(max_affected >= 3 and affected_pct > 50.0),
+        "detected": detected,
         "hour": pd.to_datetime(max_hour),
         "affected": max_affected,
         "total": total,
         "affected_pct": affected_pct,
+        "typical_affected": typical,
+        "dynamic_cutoff": dynamic_cutoff,
+        "mode": mode,
     }
 
 
@@ -1178,46 +1474,73 @@ def build_packet_problem_actions(
     packet_problem_df: pd.DataFrame,
     packet_rep: dict,
 ) -> tuple[pd.DataFrame, dict]:
-    """Attach a repair recommendation to packet-loss problems."""
+    """Attach repair recommendations to packet-loss problems."""
     system_info = detect_system_packet_loss(packet_rep)
 
     if packet_problem_df.empty:
         return pd.DataFrame(), system_info
 
     rows = []
+    loss_mat = packet_rep.get("hourly_sensor_loss", pd.DataFrame())
+
     for _, r in packet_problem_df.iterrows():
         loss_pct = float(r["loss_pct"])
+        sensor = str(r["sensor"])
+        severity = str(r.get("severity", "MEDIUM"))
 
-        if system_info["detected"]:
+        sensor_bad_hours = pd.DatetimeIndex([])
+        sensor_col = None
+
+        # Match the original column while tolerating non-string column types.
+        for col in loss_mat.columns:
+            if str(col) == sensor:
+                sensor_col = col
+                break
+
+        if sensor_col is not None:
+            bad_mask = loss_mat[sensor_col] > PACKET_LOSS_ALERT_PCT
+            sensor_bad_hours = pd.DatetimeIndex(loss_mat.index[bad_mask])
+
+        if system_info["detected"] and len(sensor_bad_hours) > 0:
             action = "Reset Pi"
             priority = "HIGH"
             why = (
-                f"{system_info['affected']}/{system_info['total']} sensors exceeded "
-                f"{PACKET_LOSS_ALERT_PCT:.0f}% packet loss in the same hour "
-                f"({_fmt_timestamp(system_info['hour'])})."
+                f"Packet loss is {loss_pct:.2f}% and the experiment shows a "
+                f"{system_info['mode']} of sensors failing together "
+                f"(peak {system_info['affected']}/{system_info['total']} sensors; "
+                f"typical {system_info['typical_affected']:.1f})."
             )
         else:
             action = "Reset Sensor"
-            priority = "MEDIUM"
+            priority = severity
             why = (
-                f"Sensor has {loss_pct:.2f}% overall packet loss while a Pi-wide "
-                "simultaneous failure pattern was not detected."
+                f"Packet loss is {loss_pct:.2f}%. Severity is {severity.title()} "
+                "relative to the other sensors above 5% in this experiment."
             )
+
+        if len(sensor_bad_hours):
+            issue_range = (
+                f"{_fmt_timestamp(sensor_bad_hours.min())} → "
+                f"{_fmt_timestamp(sensor_bad_hours.max())}"
+            )
+        else:
+            issue_range = "-"
 
         rows.append({
             "problem_type": "PACKET_LOSS",
             "file": packet_loss_file.name,
             "data_type": "Packet Loss",
-            "sensor": str(r["sensor"]),
+            "sensor": sensor,
             "issue": f"Packet Loss {loss_pct:.2f}%",
             "priority": priority,
+            "severity": severity,
             "recommended_action": action,
-            "next_action": "Replace Sensor if persists" if action == "Reset Sensor" else "Check individual sensors if persists",
-            "issue_time_range": (
-                f"System event: {_fmt_timestamp(system_info['hour'])}"
-                if system_info["detected"]
-                else "-"
+            "next_action": (
+                "Retest → Reset Sensor → Replace Sensor if persists"
+                if action == "Reset Pi"
+                else "Retest → Replace Sensor if persists"
             ),
+            "issue_time_range": issue_range,
             "loss_pct": loss_pct,
             "why": why,
             "details": (
@@ -1228,6 +1551,126 @@ def build_packet_problem_actions(
         })
 
     return pd.DataFrame(rows), system_info
+
+
+def build_unified_problem_table(
+    packet_action_df: pd.DataFrame,
+    value_issue_df: pd.DataFrame,
+    packet_system_info: dict,
+) -> pd.DataFrame:
+    """Create one action row per sensor while preserving every detected problem.
+
+    Battery problems override the primary recommended action, as requested.
+    Other problems remain visible in the same row.
+    """
+    parts = []
+    if not packet_action_df.empty:
+        parts.append(packet_action_df.copy())
+    if not value_issue_df.empty:
+        parts.append(value_issue_df.copy())
+
+    if not parts:
+        return pd.DataFrame()
+
+    all_problems = pd.concat(parts, ignore_index=True, sort=False)
+
+    severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+    rows = []
+
+    for sensor, group in all_problems.groupby("sensor", sort=False):
+        group = group.copy()
+
+        battery_rows = group[group["data_type"] == "Battery"]
+        packet_rows = group[group["data_type"] == "Packet Loss"]
+        temp_rows = group[group["data_type"] == "Temperature"]
+
+        problem_labels = []
+        for _, r in group.iterrows():
+            if r["data_type"] == "Battery":
+                problem_labels.append(f"Battery: {r['issue']}")
+            elif r["data_type"] == "Packet Loss":
+                problem_labels.append(str(r["issue"]))
+            elif r["data_type"] == "Temperature":
+                problem_labels.append(f"Temperature: {r['issue']}")
+            else:
+                problem_labels.append(f"{r['data_type']}: {r['issue']}")
+
+        # Battery overrides every other primary action.
+        if not battery_rows.empty:
+            battery = battery_rows.iloc[0]
+            battery_status = str(battery["issue"])
+
+            if battery_status == "REPLACE BATTERY":
+                recommended_action = (
+                    "Replace Battery → Retest → if other issues persist, "
+                    "Reset Sensor → Replace Sensor"
+                )
+            elif battery_status == "POSSIBLE BATTERY ISSUE":
+                recommended_action = (
+                    "Check Battery → Retest → if other issues persist, "
+                    "Reset Sensor → Replace Sensor"
+                )
+            else:
+                recommended_action = (
+                    "Check Battery/Data → Retest → if other issues persist, "
+                    "Reset Sensor → Replace Sensor"
+                )
+
+            primary_reason = str(battery.get("why", ""))
+
+        elif not packet_rows.empty and packet_system_info.get("detected", False):
+            recommended_action = (
+                "Reset Pi → Retest → if this sensor still fails, "
+                "Reset Sensor → Replace Sensor"
+            )
+            primary_reason = str(packet_rows.iloc[0].get("why", ""))
+
+        else:
+            recommended_action = "Reset Sensor → Retest → Replace Sensor if persists"
+
+            reasons = []
+            if not packet_rows.empty:
+                reasons.append(str(packet_rows.iloc[0].get("why", "")))
+            if not temp_rows.empty:
+                reasons.append(str(temp_rows.iloc[0].get("why", "")))
+            primary_reason = " | ".join([r for r in reasons if r])
+
+        group_severities = [
+            str(v) for v in group["severity"].dropna().tolist()
+            if str(v) in severity_rank
+        ]
+        highest_severity = (
+            max(group_severities, key=lambda v: severity_rank[v])
+            if group_severities else "MEDIUM"
+        )
+
+        ranges = [
+            str(v) for v in group["issue_time_range"].dropna().tolist()
+            if str(v).strip() and str(v) != "-"
+        ]
+        unique_ranges = list(dict.fromkeys(ranges))
+
+        rows.append({
+            "Sensor": str(sensor),
+            "Severity": highest_severity,
+            "Detected Problems": " | ".join(dict.fromkeys(problem_labels)),
+            "Recommended Action": recommended_action,
+            "Why": primary_reason,
+            "Time / Data Range": " | ".join(unique_ranges) if unique_ranges else "-",
+        })
+
+    out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
+
+    out["_severity_rank"] = out["Severity"].map(severity_rank).fillna(0)
+    out = out.sort_values(
+        ["_severity_rank", "Sensor"],
+        ascending=[False, True],
+    ).drop(columns=["_severity_rank"])
+
+    return out
 
 
 def plot_packet_loss_heatmap(rep: dict) -> go.Figure:
@@ -1319,7 +1762,7 @@ uploaded_files = st.sidebar.file_uploader(
     "Upload CSV / CSVs",
     type=["csv"],
     accept_multiple_files=True,
-    help="Upload one or several CSV files. Packet Loss uses the first CSV automatically.",
+    help="Upload one or several CSV files. Packet Loss source is selected automatically from the best-covered sensor file.",
 )
 
 if not uploaded_files:
@@ -1327,7 +1770,6 @@ if not uploaded_files:
     st.stop()
 
 # Compact uploaded-file cards.
-# There is still NO selector here: packet loss always uses the first CSV.
 st.sidebar.markdown("---")
 st.sidebar.subheader("Uploaded Data")
 
@@ -1356,12 +1798,11 @@ for sidebar_i, sidebar_file in enumerate(uploaded_files, start=1):
         st.sidebar.markdown(f"**📄 {sidebar_i}. {sidebar_file.name}**")
         st.sidebar.caption(f"Could not read file information: {sidebar_e}")
 
-# No sidebar file selector: packet loss always uses the first CSV.
-packet_loss_file = uploaded_files[0]
-packet_loss_df = read_uploaded_csv(packet_loss_file)
+# Packet Loss source is selected automatically; upload order does not matter.
+packet_loss_file, packet_loss_df, packet_loss_source_info = select_packet_loss_source(uploaded_files)
 
 # =========================================================
-# 8) Pre-compute packet loss for the first CSV
+# 8) Pre-compute packet loss
 # =========================================================
 packet_rep = None
 packet_sensor_loss_df = pd.DataFrame()
@@ -1374,6 +1815,14 @@ try:
     packet_problem_df = packet_sensor_loss_df[
         packet_sensor_loss_df["loss_pct"] > PACKET_LOSS_ALERT_PCT
     ].copy()
+
+    # >5% remains the fixed definition of a packet-loss problem.
+    # Low/Medium/High is adaptive relative to the problem sensors in this experiment.
+    packet_problem_df = add_adaptive_severity(
+        packet_problem_df,
+        value_col="loss_pct",
+        severity_col="severity",
+    )
 except Exception as e:
     packet_error = e
 
@@ -1416,8 +1865,6 @@ for i, file in enumerate(uploaded_files, start=1):
                 data_type=auto_type,
                 battery_threshold_mv=DEFAULT_BATTERY_LOW_MV,
                 battery_last_n=DEFAULT_BATTERY_LAST_N,
-                stuck_run_threshold=DEFAULT_STUCK_RUN_THRESHOLD,
-                stuck_round_decimals=DEFAULT_STUCK_ROUND_DECIMALS,
             )
 
             issue_df = result_issues_only(health_df)
@@ -1449,8 +1896,8 @@ for i, file in enumerate(uploaded_files, start=1):
                     details = " | ".join([
                         f"values={issue_row.get('values_count', '')}",
                         f"minus_40_count={issue_row.get('minus_40_count', '')}",
-                        f"max_stuck_run={issue_row.get('max_stuck_run', '')}",
-                        f"stuck_value={issue_row.get('stuck_value', '')}",
+                        f"minus_40_pct={issue_row.get('minus_40_pct', np.nan):.2f}%"
+                        if pd.notna(issue_row.get("minus_40_pct", np.nan)) else "minus_40_pct=-",
                     ])
                 else:
                     details = str(issue_row.get("note", ""))
@@ -1462,6 +1909,7 @@ for i, file in enumerate(uploaded_files, start=1):
                     "sensor": str(issue_row.get("sensor", "")),
                     "issue": issue_row.get("status", ""),
                     "priority": issue_row.get("priority", ""),
+                    "severity": issue_row.get("severity", normalized_severity(issue_row.get("priority", ""))),
                     "recommended_action": issue_row.get("recommended_action", ""),
                     "next_action": issue_row.get("next_action", ""),
                     "issue_time_range": build_issue_time_range(issue_row, auto_type),
@@ -1502,127 +1950,148 @@ tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
 # =========================================================
 with tab_summary:
     st.subheader("Summary")
+
+    experiment_name = infer_experiment_name(uploaded_files)
+
+    all_sensor_names = set()
+    if not packet_sensor_loss_df.empty:
+        all_sensor_names.update(packet_sensor_loss_df["sensor"].astype(str).tolist())
+    if not summary_health_df.empty:
+        all_sensor_names.update(summary_health_df["sensor"].astype(str).tolist())
+
+    attention_sensor_names = set()
+    if not packet_action_df.empty:
+        attention_sensor_names.update(packet_action_df["sensor"].astype(str).tolist())
+    if not summary_value_issues_df.empty:
+        attention_sensor_names.update(summary_value_issues_df["sensor"].astype(str).tolist())
+
+    total_sensors = len(all_sensor_names)
+    sensors_need_attention = len(attention_sensor_names)
+
+    top1, top2, top3 = st.columns([2.2, 1, 1])
+    with top1:
+        st.metric("Experiment", experiment_name)
+    with top2:
+        st.metric("Total Sensors", total_sensors)
+    with top3:
+        st.metric("Need Attention", sensors_need_attention)
+
     st.caption(
-        f"{len(uploaded_files)} CSV file(s) uploaded. "
-        "Battery analysis uses only the last 20 available values per sensor."
+        f"{sensors_need_attention} / {total_sensors} unique sensors require attention. "
+        "A sensor is counted once even if it has more than one problem."
     )
 
     # -----------------------------------------------------
-    # One compact donut: detected problem types
+    # One donut per problem type, split by severity
     # -----------------------------------------------------
-    problem_type_rows = []
+    st.markdown("### Problem Severity")
 
-    if not packet_problem_df.empty:
-        problem_type_rows.extend(["Packet Loss"] * len(packet_problem_df))
+    packet_severity_df = pd.DataFrame(columns=["sensor", "severity"])
+    if not packet_action_df.empty:
+        packet_severity_df = packet_action_df[["sensor", "severity"]].copy()
+
+    battery_status_df = pd.DataFrame(columns=["sensor", "issue", "severity"])
+    temperature_severity_df = pd.DataFrame(columns=["sensor", "severity"])
 
     if not summary_value_issues_df.empty:
-        problem_type_rows.extend(summary_value_issues_df["data_type"].astype(str).tolist())
+        battery_status_df = summary_value_issues_df[
+            summary_value_issues_df["data_type"] == "Battery"
+        ][["sensor", "issue", "severity"]].copy()
 
-    st.markdown("### Detected Problems")
+        temperature_severity_df = summary_value_issues_df[
+            summary_value_issues_df["data_type"] == "Temperature"
+        ][["sensor", "severity"]].copy()
 
-    if not problem_type_rows:
-        st.success("✅ No detected problems.")
-    else:
-        problem_type_counts = (
-            pd.Series(problem_type_rows, name="Problem Type")
-            .value_counts()
-            .rename_axis("Problem Type")
-            .reset_index(name="Count")
-        )
+    severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
-        fig_problem_types = go.Figure(
-            data=[go.Pie(
-                labels=problem_type_counts["Problem Type"],
-                values=problem_type_counts["Count"],
-                hole=0.52,
-                textinfo="label+value",
-                hovertemplate="%{label}<br>Count=%{value}<br>%{percent}<extra></extra>",
-            )]
-        )
-        fig_problem_types.update_layout(
-            template="plotly_white",
-            margin=dict(t=10, b=10, l=10, r=10),
-            showlegend=False,
-            height=360,
-        )
-        st.plotly_chart(
-            fig_problem_types,
-            use_container_width=True,
-            key="summary_problem_type_donut",
-        )
+    def _dedupe_highest_severity(df):
+        if df.empty:
+            return df
+        temp = df.copy()
+        temp["_rank"] = temp["severity"].map(severity_rank).fillna(1)
+        temp = temp.sort_values("_rank", ascending=False).drop_duplicates("sensor")
+        return temp.drop(columns=["_rank"])
+
+    packet_severity_df = _dedupe_highest_severity(packet_severity_df)
+    temperature_severity_df = _dedupe_highest_severity(temperature_severity_df)
+
+    pie1, pie2, pie3 = st.columns(3)
+
+    with pie1:
+        if packet_severity_df.empty:
+            st.markdown("#### Packet Loss")
+            st.success("No sensors above 5%")
+        else:
+            st.plotly_chart(
+                plot_severity_donut(packet_severity_df, "Packet Loss"),
+                use_container_width=True,
+                key="summary_packet_loss_severity",
+            )
+
+    with pie2:
+        if battery_status_df.empty:
+            st.markdown("#### Battery")
+            st.success("No battery problems")
+        else:
+            st.plotly_chart(
+                plot_battery_status_donut(battery_status_df, "Battery"),
+                use_container_width=True,
+                key="summary_battery_status",
+            )
+
+    with pie3:
+        if temperature_severity_df.empty:
+            st.markdown("#### Temperature")
+            st.success("No temperature problems")
+        else:
+            st.plotly_chart(
+                plot_severity_donut(temperature_severity_df, "Temperature"),
+                use_container_width=True,
+                key="summary_temperature_severity",
+            )
+
+    st.caption(
+        "Packet Loss and Temperature severity are calculated adaptively from this experiment's own "
+        "problem distribution. The only fixed Packet Loss rule is that a sensor must be above 5% "
+        "to be considered a problem. Battery keeps its real decision-tree status names."
+    )
 
     # -----------------------------------------------------
-    # One central table: problem + what to do
+    # Central action table - one row per sensor
     # -----------------------------------------------------
     st.markdown("---")
-    st.markdown("### Problems & Recommended Actions")
+    st.markdown("### Sensors Needing Attention")
 
     if packet_system_info.get("detected", False):
-        st.error(
-            "🔄 **Reset Pi recommended first:** "
-            f"{packet_system_info['affected']} / {packet_system_info['total']} sensors "
-            f"had packet loss above {PACKET_LOSS_ALERT_PCT:.0f}% in the same hour "
-            f"({_fmt_timestamp(packet_system_info['hour'])})."
+        st.warning(
+            "🔄 **Pi-level packet-loss pattern detected:** "
+            f"peak {packet_system_info['affected']} / {packet_system_info['total']} sensors affected together "
+            f"({_fmt_timestamp(packet_system_info['hour'])}); "
+            f"typical simultaneous count is {packet_system_info['typical_affected']:.1f}. "
+            "Reset Pi is recommended first for affected sensors unless a battery problem is present."
         )
 
-    problem_parts = []
-    if not packet_action_df.empty:
-        problem_parts.append(packet_action_df.copy())
-    if not summary_value_issues_df.empty:
-        problem_parts.append(summary_value_issues_df.copy())
+    unified_problem_df = build_unified_problem_table(
+        packet_action_df,
+        summary_value_issues_df,
+        packet_system_info,
+    )
 
-    if not problem_parts:
+    if unified_problem_df.empty:
         st.success("✅ No action is currently required.")
     else:
-        problems_df = pd.concat(problem_parts, ignore_index=True, sort=False)
-
-        # Keep the main dashboard table intentionally compact.
-        problems_display = problems_df[[
-            "sensor",
-            "data_type",
-            "issue",
-            "recommended_action",
-            "why",
-            "issue_time_range",
-        ]].rename(columns={
-            "sensor": "Sensor",
-            "data_type": "Problem",
-            "issue": "Status / Issue",
-            "recommended_action": "Recommended Action",
-            "why": "Why",
-            "issue_time_range": "Time / Data Range",
-        })
-
         st.dataframe(
-            problems_display,
+            unified_problem_df,
             hide_index=True,
             use_container_width=True,
         )
 
-    # -----------------------------------------------------
-    # Packet-loss distribution - keep as requested
-    # -----------------------------------------------------
-    st.markdown("---")
-    st.markdown("### Distribution of Sensor Packet Loss (%)")
-
-    if packet_error is not None:
-        st.error(f"Could not calculate packet loss from the first CSV: {packet_error}")
-    else:
-        st.caption(
-            f"Packet loss is calculated from the first uploaded CSV: **{packet_loss_file.name}**"
-        )
-        st.plotly_chart(
-            plot_sensor_loss_distribution(packet_sensor_loss_df),
-            use_container_width=True,
-            key="summary_packet_loss_distribution",
-        )
-
 
 # =========================================================
-# 10B) Packet Loss Analysis tab - first CSV only
+# 10B) Packet Loss Analysis tab
 # =========================================================
 with tab_packet_loss:
-    st.subheader(f"Packet Loss Analysis - first CSV: {packet_loss_file.name}")
+    st.subheader(f"Packet Loss Analysis - source: {packet_loss_file.name}")
 
     if packet_error is not None:
         st.error(f"Error processing packet-loss analysis: {packet_error}")
@@ -1641,24 +2110,24 @@ with tab_packet_loss:
             if packet_system_info.get("detected", False):
                 st.warning(
                     "🔄 Recommended first action: **Reset Pi**. "
-                    f"{packet_system_info['affected']} / {packet_system_info['total']} sensors "
-                    f"crossed the packet-loss threshold in the same hour "
-                    f"({_fmt_timestamp(packet_system_info['hour'])})."
+                    f"Peak simultaneous impact: {packet_system_info['affected']} / {packet_system_info['total']} sensors "
+                    f"({_fmt_timestamp(packet_system_info['hour'])}); "
+                    f"typical simultaneous impact: {packet_system_info['typical_affected']:.1f} sensors."
                 )
 
             display_df = packet_action_df[[
                 "sensor",
                 "loss_pct",
-                "priority",
+                "severity",
                 "recommended_action",
                 "next_action",
                 "why",
             ]].rename(columns={
                 "sensor": "Sensor",
                 "loss_pct": "Loss (%)",
-                "priority": "Priority",
+                "severity": "Relative Severity",
                 "recommended_action": "Recommended Action",
-                "next_action": "If It Persists",
+                "next_action": "Next Step",
                 "why": "Why",
             })
 
@@ -1772,37 +2241,12 @@ with tab_data_analysis:
 
     st.caption(
         "Battery: last 20 values only (<2700 mV = low) • "
-        "Temperature: -40°C + stuck values • Light: no automatic value rule yet"
+        "Temperature: -40°C error values only • Light: no automatic value rule yet"
     )
 
-    with st.expander("Data Analysis Settings", expanded=False):
-        st.markdown(
-            "**Battery rules are fixed:** last **20** available values per sensor, "
-            f"low battery is **< {DEFAULT_BATTERY_LOW_MV} mV**. "
-            "Current time is not used."
-        )
-
-        col_s1, col_s2 = st.columns(2)
-
-        with col_s1:
-            stuck_run_threshold = st.number_input(
-                "TEMP stuck-value run threshold",
-                min_value=2,
-                max_value=100,
-                value=DEFAULT_STUCK_RUN_THRESHOLD,
-                step=1,
-                help="Used only for Temperature. Example: threshold 4 flags values like 23.00, 23.00, 23.00, 23.00.",
-            )
-
-        with col_s2:
-            stuck_round_decimals = st.number_input(
-                "TEMP stuck check decimal places",
-                min_value=0,
-                max_value=6,
-                value=DEFAULT_STUCK_ROUND_DECIMALS,
-                step=1,
-                help="Used only for Temperature. Default 2 means 23.001 and 23.004 are both treated as 23.00.",
-            )
+    st.caption(
+        "Battery rules are fixed: the last 20 available values are analyzed and current time is not used."
+    )
 
     # Analyze each uploaded file.
     for file_index, file in enumerate(uploaded_files, start=1):
@@ -1848,8 +2292,6 @@ with tab_data_analysis:
                     data_type=data_type,
                     battery_threshold_mv=DEFAULT_BATTERY_LOW_MV,
                     battery_last_n=DEFAULT_BATTERY_LAST_N,
-                    stuck_run_threshold=int(stuck_run_threshold),
-                    stuck_round_decimals=int(stuck_round_decimals),
                 )
 
                 issue_df = result_issues_only(result_df)
