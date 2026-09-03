@@ -1,5 +1,4 @@
 import io
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -28,8 +27,12 @@ PACKET_LOSS_ALERT_PCT = 5.0
 
 # Default health-check rules.
 DEFAULT_BATTERY_LOW_MV = 2700
-DEFAULT_BATTERY_LAST_N = 20
-DEFAULT_BATTERY_ALLOWED_LOW_COUNT = 3
+DEFAULT_BATTERY_LAST_N = 20  # Fixed: always analyze the last 20 available battery values.
+BATTERY_MIN_OK_VALUES = 20
+BATTERY_REPLACE_CONSECUTIVE_LOW = 6
+BATTERY_POSSIBLE_LOW_COUNT = 3
+BATTERY_REPLACE_LOW_PCT = 20.0
+
 DEFAULT_STUCK_RUN_THRESHOLD = 4
 DEFAULT_STUCK_ROUND_DECIMALS = 2
 
@@ -637,62 +640,230 @@ def plot_sensor_loss_distribution(df_s: pd.DataFrame, bin_size: float = 0.5) -> 
 # =========================================================
 # 5) Data-analysis health checks
 # =========================================================
+def _longest_true_run(mask: pd.Series) -> dict:
+    """Return the longest consecutive True run in a boolean Series."""
+    best_len = 0
+    best_start = pd.NaT
+    best_end = pd.NaT
+
+    current_len = 0
+    current_start = pd.NaT
+    current_end = pd.NaT
+
+    for timestamp, is_true in mask.items():
+        if bool(is_true):
+            if current_len == 0:
+                current_start = timestamp
+            current_len += 1
+            current_end = timestamp
+
+            if current_len > best_len:
+                best_len = current_len
+                best_start = current_start
+                best_end = current_end
+        else:
+            current_len = 0
+            current_start = pd.NaT
+            current_end = pd.NaT
+
+    return {
+        "max_run": int(best_len),
+        "run_start_time": best_start,
+        "run_end_time": best_end,
+    }
+
+
 def analyze_battery(
     wide: pd.DataFrame,
     low_mv_threshold: float = DEFAULT_BATTERY_LOW_MV,
     last_n: int = DEFAULT_BATTERY_LAST_N,
-    low_count_limit: int = DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
 ) -> pd.DataFrame:
-    """Battery health rule.
+    """Battery health decision tree.
 
-    Requested rule:
-    - Take last 20 values.
-    - If more than 3 values are under 2700 mV -> LOW_BATTERY.
-    - If there are 3 or fewer timestamps to check -> flag if at least 1 value is under 2700 mV.
+    Important:
+    - Battery status is based ONLY on the last 20 available values per sensor.
+    - Current time is never used, so historical CSV files are analyzed correctly.
+    - Timestamp is used only to show the analyzed/issue range.
+
+    Decision tree:
+    0-2 values:
+        INSUFFICIENT BATTERY DATA
+
+    3-5 values:
+        all values < threshold -> REPLACE BATTERY
+        otherwise -> LIMITED BATTERY DATA
+
+    6-19 values:
+        >= 6 consecutive low values -> REPLACE BATTERY
+        otherwise, >= 3 low values -> POSSIBLE BATTERY ISSUE
+        otherwise -> LIMITED BATTERY DATA
+
+    20 values:
+        >= 6 consecutive low values -> REPLACE BATTERY
+        otherwise, > 20% low values -> REPLACE BATTERY
+        otherwise, >= 3 low values -> POSSIBLE BATTERY ISSUE
+        otherwise -> OK
     """
     rows = []
+
+    # User requirement: fixed analysis window of 20 available measurements.
+    last_n = DEFAULT_BATTERY_LAST_N
 
     for sensor in wide.columns:
         s = pd.to_numeric(wide[sensor], errors="coerce").dropna().sort_index()
         last_values = s.tail(last_n)
 
         n_checked = int(len(last_values))
-        under_count = int((last_values < low_mv_threshold).sum())
+        low_mask = last_values < low_mv_threshold
+        low_count = int(low_mask.sum())
+        low_pct = (low_count / n_checked * 100.0) if n_checked else np.nan
 
-        if n_checked == 0:
-            status = "NO_DATA"
+        run_info = _longest_true_run(low_mask)
+        max_low_run = int(run_info["max_run"])
+
+        analysis_start = last_values.index.min() if n_checked else pd.NaT
+        analysis_end = last_values.index.max() if n_checked else pd.NaT
+        low_values = last_values[low_mask]
+
+        if n_checked <= 2:
+            status = "INSUFFICIENT BATTERY DATA"
             issue = True
-            rule_used = "No values available"
-        elif n_checked <= low_count_limit:
-            issue = under_count >= 1
-            status = "LOW_BATTERY" if issue else "OK"
-            rule_used = f"Only {n_checked} timestamp(s): flag if at least 1 value < {low_mv_threshold:.0f} mV"
-        else:
-            issue = under_count > low_count_limit
-            status = "LOW_BATTERY" if issue else "OK"
-            rule_used = f"Last {last_n}: flag if more than {low_count_limit} values < {low_mv_threshold:.0f} mV"
+            priority = "CHECK"
+            recommended_action = "Check Data"
+            why = f"Only {n_checked} battery value(s) available in the last 20-value window."
+            rule_used = "0-2 values -> INSUFFICIENT BATTERY DATA"
 
-        low_times = last_values[last_values < low_mv_threshold]
+        elif n_checked <= 5:
+            if low_count == n_checked:
+                status = "REPLACE BATTERY"
+                issue = True
+                priority = "HIGH"
+                recommended_action = "Replace Battery"
+                why = f"All {n_checked}/{n_checked} available values are below {low_mv_threshold:.0f} mV."
+                rule_used = "3-5 values and all are low -> REPLACE BATTERY"
+            else:
+                status = "LIMITED BATTERY DATA"
+                issue = True
+                priority = "CHECK"
+                recommended_action = "Check Data"
+                why = f"Only {n_checked} values are available; not enough evidence for a reliable battery status."
+                rule_used = "3-5 values and not all are low -> LIMITED BATTERY DATA"
+
+        elif n_checked < BATTERY_MIN_OK_VALUES:
+            if max_low_run >= BATTERY_REPLACE_CONSECUTIVE_LOW:
+                status = "REPLACE BATTERY"
+                issue = True
+                priority = "HIGH"
+                recommended_action = "Replace Battery"
+                why = (
+                    f"{max_low_run} consecutive values are below "
+                    f"{low_mv_threshold:.0f} mV."
+                )
+                rule_used = f"6-19 values and >= {BATTERY_REPLACE_CONSECUTIVE_LOW} consecutive low -> REPLACE BATTERY"
+            elif low_count >= BATTERY_POSSIBLE_LOW_COUNT:
+                status = "POSSIBLE BATTERY ISSUE"
+                issue = True
+                priority = "MEDIUM"
+                recommended_action = "Check Battery"
+                why = (
+                    f"{low_count}/{n_checked} values are below "
+                    f"{low_mv_threshold:.0f} mV, but there are fewer than 20 values."
+                )
+                rule_used = f"6-19 values and >= {BATTERY_POSSIBLE_LOW_COUNT} low -> POSSIBLE BATTERY ISSUE"
+            else:
+                status = "LIMITED BATTERY DATA"
+                issue = True
+                priority = "CHECK"
+                recommended_action = "Check Data"
+                why = (
+                    f"Only {n_checked} values are available and there is no strong low-battery pattern."
+                )
+                rule_used = "6-19 values without a strong low-battery pattern -> LIMITED BATTERY DATA"
+
+        else:
+            if max_low_run >= BATTERY_REPLACE_CONSECUTIVE_LOW:
+                status = "REPLACE BATTERY"
+                issue = True
+                priority = "HIGH"
+                recommended_action = "Replace Battery"
+                why = (
+                    f"{max_low_run} consecutive values are below "
+                    f"{low_mv_threshold:.0f} mV."
+                )
+                rule_used = f"20 values and >= {BATTERY_REPLACE_CONSECUTIVE_LOW} consecutive low -> REPLACE BATTERY"
+            elif low_pct > BATTERY_REPLACE_LOW_PCT:
+                status = "REPLACE BATTERY"
+                issue = True
+                priority = "HIGH"
+                recommended_action = "Replace Battery"
+                why = (
+                    f"{low_count}/20 values ({low_pct:.1f}%) are below "
+                    f"{low_mv_threshold:.0f} mV (> {BATTERY_REPLACE_LOW_PCT:.0f}%)."
+                )
+                rule_used = f"20 values and > {BATTERY_REPLACE_LOW_PCT:.0f}% low -> REPLACE BATTERY"
+            elif low_count >= BATTERY_POSSIBLE_LOW_COUNT:
+                status = "POSSIBLE BATTERY ISSUE"
+                issue = True
+                priority = "MEDIUM"
+                recommended_action = "Check Battery"
+                why = (
+                    f"{low_count}/20 values are below "
+                    f"{low_mv_threshold:.0f} mV."
+                )
+                rule_used = f"20 values and >= {BATTERY_POSSIBLE_LOW_COUNT} low -> POSSIBLE BATTERY ISSUE"
+            else:
+                status = "OK"
+                issue = False
+                priority = "OK"
+                recommended_action = "No Action"
+                why = (
+                    f"{low_count}/20 values are below {low_mv_threshold:.0f} mV "
+                    "and no long consecutive low run was detected."
+                )
+                rule_used = "20 values with no battery warning rule -> OK"
 
         rows.append({
             "sensor": str(sensor),
             "status": status,
             "has_issue": bool(issue),
+            "priority": priority,
+            "recommended_action": recommended_action,
+            "why": why,
             "values_checked": n_checked,
-            "under_threshold_count": under_count,
+            "under_threshold_count": low_count,
+            "low_percentage": low_pct,
             "threshold_mV": low_mv_threshold,
+            "max_consecutive_low": max_low_run,
             "last_value_mV": float(last_values.iloc[-1]) if n_checked else np.nan,
             "min_last_values_mV": float(last_values.min()) if n_checked else np.nan,
-            "first_low_time_in_last_values": low_times.index.min() if not low_times.empty else pd.NaT,
-            "last_low_time_in_last_values": low_times.index.max() if not low_times.empty else pd.NaT,
+            "analysis_start_time": analysis_start,
+            "analysis_end_time": analysis_end,
+            "first_low_time_in_last_values": low_values.index.min() if not low_values.empty else pd.NaT,
+            "last_low_time_in_last_values": low_values.index.max() if not low_values.empty else pd.NaT,
+            "consecutive_low_start_time": run_info["run_start_time"],
+            "consecutive_low_end_time": run_info["run_end_time"],
             "rule_used": rule_used,
         })
 
-    return pd.DataFrame(rows).sort_values(
-        by=["has_issue", "under_threshold_count", "min_last_values_mV"],
-        ascending=[False, False, True],
-    )
+    out = pd.DataFrame(rows)
 
+    if out.empty:
+        return out
+
+    priority_order = {
+        "HIGH": 0,
+        "MEDIUM": 1,
+        "CHECK": 2,
+        "OK": 3,
+    }
+    out["_priority_order"] = out["priority"].map(priority_order).fillna(9)
+
+    out = out.sort_values(
+        by=["_priority_order", "under_threshold_count", "min_last_values_mV"],
+        ascending=[True, False, True],
+    ).drop(columns=["_priority_order"])
+
+    return out
 
 def longest_equal_run(series: pd.Series, decimals: int = DEFAULT_STUCK_ROUND_DECIMALS, ignore_values: set = None) -> dict:
     """Find the longest consecutive run of equal values.
@@ -771,11 +942,35 @@ def analyze_temperature(
             issues.append("STUCK_VALUE")
 
         has_issue = len(issues) > 0
+        status = "OK" if not has_issue else " / ".join(issues)
+
+        if has_issue:
+            priority = "HIGH" if len(issues) > 1 else "MEDIUM"
+            recommended_action = "Reset Sensor"
+            next_action = "Replace Sensor if persists"
+
+            why_parts = []
+            if bad_temp_count > 0:
+                why_parts.append(f"{bad_temp_count} value(s) at or below {bad_temp_value:.0f}°C")
+            if is_stuck:
+                why_parts.append(
+                    f"same rounded value repeated {run_info['max_stuck_run']} consecutive times"
+                )
+            why = "; ".join(why_parts)
+        else:
+            priority = "OK"
+            recommended_action = "No Action"
+            next_action = ""
+            why = "No -40°C values and no stuck-value run detected."
 
         rows.append({
             "sensor": str(sensor),
-            "status": "OK" if not has_issue else " / ".join(issues),
+            "status": status,
             "has_issue": has_issue,
+            "priority": priority,
+            "recommended_action": recommended_action,
+            "next_action": next_action,
+            "why": why,
             "values_count": int(len(s)),
             "minus_40_count": bad_temp_count,
             "first_minus_40_time": s[bad_temp_mask].index.min() if bad_temp_count else pd.NaT,
@@ -812,6 +1007,10 @@ def analyze_light(wide: pd.DataFrame) -> pd.DataFrame:
             "sensor": str(sensor),
             "status": "OK",
             "has_issue": False,
+            "priority": "OK",
+            "recommended_action": "No Action",
+            "next_action": "",
+            "why": "No automatic Light value-health rule is currently enabled.",
             "values_count": int(len(s)),
             "last_value": float(s.iloc[-1]) if len(s) else np.nan,
             "note": "No stuck-value check for Light. Stuck-value check is only for Temperature.",
@@ -825,7 +1024,6 @@ def run_data_health_check(
     data_type: str,
     battery_threshold_mv: float = DEFAULT_BATTERY_LOW_MV,
     battery_last_n: int = DEFAULT_BATTERY_LAST_N,
-    battery_low_count_limit: int = DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
     stuck_run_threshold: int = DEFAULT_STUCK_RUN_THRESHOLD,
     stuck_round_decimals: int = DEFAULT_STUCK_ROUND_DECIMALS,
 ) -> pd.DataFrame:
@@ -837,8 +1035,7 @@ def run_data_health_check(
         return analyze_battery(
             wide,
             low_mv_threshold=battery_threshold_mv,
-            last_n=battery_last_n,
-            low_count_limit=battery_low_count_limit,
+            last_n=DEFAULT_BATTERY_LAST_N,
         )
 
     if data_type == "Temperature":
@@ -880,6 +1077,196 @@ def result_issues_only(result_df: pd.DataFrame) -> pd.DataFrame:
         return result_df[result_df["status"] != "OK"].copy()
 
     return result_df.iloc[0:0].copy()
+
+
+def _fmt_timestamp(ts) -> str:
+    """Format a timestamp for compact dashboard display."""
+    if pd.isna(ts):
+        return "-"
+    return pd.to_datetime(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def build_issue_time_range(issue_row: pd.Series, data_type: str) -> str:
+    """Describe when the detected issue occurred.
+
+    Time never affects battery status. For Battery it only shows the range of
+    the last 20 values that were analyzed.
+    """
+    if data_type == "Battery":
+        start = issue_row.get("analysis_start_time", pd.NaT)
+        end = issue_row.get("analysis_end_time", pd.NaT)
+        if pd.isna(start) or pd.isna(end):
+            return "-"
+        return f"Analyzed values: {_fmt_timestamp(start)} → {_fmt_timestamp(end)}"
+
+    if data_type == "Temperature":
+        ranges = []
+        status = str(issue_row.get("status", ""))
+
+        if "TEMP_-40" in status:
+            start = issue_row.get("first_minus_40_time", pd.NaT)
+            end = issue_row.get("last_minus_40_time", pd.NaT)
+            if not pd.isna(start) and not pd.isna(end):
+                ranges.append(f"-40: {_fmt_timestamp(start)} → {_fmt_timestamp(end)}")
+
+        if "STUCK_VALUE" in status:
+            start = issue_row.get("stuck_start_time", pd.NaT)
+            end = issue_row.get("stuck_end_time", pd.NaT)
+            if not pd.isna(start) and not pd.isna(end):
+                ranges.append(f"Stuck: {_fmt_timestamp(start)} → {_fmt_timestamp(end)}")
+
+        return " | ".join(ranges) if ranges else "-"
+
+    return "-"
+
+
+def detect_system_packet_loss(rep: dict, threshold_pct: float = PACKET_LOSS_ALERT_PCT) -> dict:
+    """Detect a likely Pi-level packet-loss event.
+
+    Conservative rule:
+    - at least 3 sensors exist, and
+    - more than half of the sensors exceed the packet-loss threshold
+      in the same hour.
+
+    This does not prove the Pi is the cause; it is used only to recommend
+    checking/resetting the Pi before touching many individual sensors.
+    """
+    if not rep or rep.get("hourly_sensor_loss") is None:
+        return {
+            "detected": False,
+            "hour": pd.NaT,
+            "affected": 0,
+            "total": 0,
+            "affected_pct": 0.0,
+        }
+
+    loss_mat = rep["hourly_sensor_loss"]
+    if loss_mat.empty:
+        return {
+            "detected": False,
+            "hour": pd.NaT,
+            "affected": 0,
+            "total": 0,
+            "affected_pct": 0.0,
+        }
+
+    total = int(loss_mat.shape[1])
+    if total < 3:
+        return {
+            "detected": False,
+            "hour": pd.NaT,
+            "affected": 0,
+            "total": total,
+            "affected_pct": 0.0,
+        }
+
+    affected_counts = (loss_mat > threshold_pct).sum(axis=1)
+    max_hour = affected_counts.idxmax()
+    max_affected = int(affected_counts.loc[max_hour])
+    affected_pct = max_affected / total * 100.0 if total else 0.0
+
+    return {
+        "detected": bool(max_affected >= 3 and affected_pct > 50.0),
+        "hour": pd.to_datetime(max_hour),
+        "affected": max_affected,
+        "total": total,
+        "affected_pct": affected_pct,
+    }
+
+
+def build_packet_problem_actions(
+    packet_problem_df: pd.DataFrame,
+    packet_rep: dict,
+) -> tuple[pd.DataFrame, dict]:
+    """Attach a repair recommendation to packet-loss problems."""
+    system_info = detect_system_packet_loss(packet_rep)
+
+    if packet_problem_df.empty:
+        return pd.DataFrame(), system_info
+
+    rows = []
+    for _, r in packet_problem_df.iterrows():
+        loss_pct = float(r["loss_pct"])
+
+        if system_info["detected"]:
+            action = "Reset Pi"
+            priority = "HIGH"
+            why = (
+                f"{system_info['affected']}/{system_info['total']} sensors exceeded "
+                f"{PACKET_LOSS_ALERT_PCT:.0f}% packet loss in the same hour "
+                f"({_fmt_timestamp(system_info['hour'])})."
+            )
+        else:
+            action = "Reset Sensor"
+            priority = "MEDIUM"
+            why = (
+                f"Sensor has {loss_pct:.2f}% overall packet loss while a Pi-wide "
+                "simultaneous failure pattern was not detected."
+            )
+
+        rows.append({
+            "problem_type": "PACKET_LOSS",
+            "file": packet_loss_file.name,
+            "data_type": "Packet Loss",
+            "sensor": str(r["sensor"]),
+            "issue": f"Packet Loss {loss_pct:.2f}%",
+            "priority": priority,
+            "recommended_action": action,
+            "next_action": "Replace Sensor if persists" if action == "Reset Sensor" else "Check individual sensors if persists",
+            "issue_time_range": (
+                f"System event: {_fmt_timestamp(system_info['hour'])}"
+                if system_info["detected"]
+                else "-"
+            ),
+            "loss_pct": loss_pct,
+            "why": why,
+            "details": (
+                f"lost_packets={int(r['lost_packets'])} | "
+                f"expected_packets={int(r['expected_packets'])} | "
+                f"received_packets={int(r['packets_received'])}"
+            ),
+        })
+
+    return pd.DataFrame(rows), system_info
+
+
+def plot_packet_loss_heatmap(rep: dict) -> go.Figure:
+    """Sensor x hour heatmap of packet-loss percentage."""
+    loss_mat = rep["hourly_sensor_loss"].copy()
+
+    # Sensors as rows, hours as columns.
+    z = loss_mat.T.to_numpy(dtype=float)
+    x = [pd.to_datetime(x) for x in loss_mat.index]
+    y = [str(y) for y in loss_mat.columns]
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=x,
+            y=y,
+            zmin=0,
+            zmax=100,
+            colorbar=dict(title="Loss %"),
+            hovertemplate=(
+                "Hour: %{x|%Y-%m-%d %H:00}<br>"
+                "Sensor: %{y}<br>"
+                "Packet Loss: %{z:.2f}%<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        template="plotly_white",
+        title="Packet Loss Heatmap - Sensor × Hour",
+        xaxis_title="Hour",
+        yaxis_title="Sensor",
+        margin=dict(t=60, b=80),
+        height=max(450, min(1000, 180 + 18 * len(y))),
+    )
+    fig.update_xaxes(type="date", automargin=True)
+
+    return fig
+
 
 
 # =========================================================
@@ -939,26 +1326,35 @@ if not uploaded_files:
     st.info("Upload one or more CSV files from the left sidebar to begin analysis.")
     st.stop()
 
-# Show each uploaded CSV name and its min/max timestamp in the left sidebar.
-# There is still NO selector here: packet loss always uses the first uploaded CSV.
+# Compact uploaded-file cards.
+# There is still NO selector here: packet loss always uses the first CSV.
 st.sidebar.markdown("---")
-st.sidebar.subheader("CSV Time Ranges")
+st.sidebar.subheader("Uploaded Data")
+
+sidebar_icons = {
+    "Battery": "🔋",
+    "Temperature": "🌡️",
+    "Light": "☀️",
+    "Other": "📄",
+}
 
 for sidebar_i, sidebar_file in enumerate(uploaded_files, start=1):
     try:
         sidebar_info = get_basic_file_info(sidebar_file)
         sidebar_start = sidebar_info["start"]
         sidebar_end = sidebar_info["end"]
+        sidebar_type = sidebar_info["auto_type"]
+        sidebar_icon = sidebar_icons.get(sidebar_type, "📄")
 
-        st.sidebar.markdown(f"**{sidebar_i}. {sidebar_file.name}**")
+        st.sidebar.markdown(f"**{sidebar_icon} {sidebar_i}. {sidebar_file.name}**")
         st.sidebar.caption(
-            f"Min: {sidebar_start:%Y-%m-%d %H:%M}  \n"
-            f"Max: {sidebar_end:%Y-%m-%d %H:%M}"
+            f"{sidebar_type} • {sidebar_info['sensors']} sensors  \n"
+            f"{sidebar_start:%Y-%m-%d %H:%M} → {sidebar_end:%Y-%m-%d %H:%M}"
         )
 
     except Exception as sidebar_e:
-        st.sidebar.markdown(f"**{sidebar_i}. {sidebar_file.name}**")
-        st.sidebar.caption(f"Could not read time range: {sidebar_e}")
+        st.sidebar.markdown(f"**📄 {sidebar_i}. {sidebar_file.name}**")
+        st.sidebar.caption(f"Could not read file information: {sidebar_e}")
 
 # No sidebar file selector: packet loss always uses the first CSV.
 packet_loss_file = uploaded_files[0]
@@ -983,9 +1379,10 @@ except Exception as e:
 
 
 # =========================================================
-# 9) Pre-compute value issues for summary, using default rules
+# 9) Pre-compute health results for Summary
 # =========================================================
 summary_value_issue_rows = []
+summary_health_rows = []
 summary_file_rows = []
 
 for i, file in enumerate(uploaded_files, start=1):
@@ -1019,28 +1416,58 @@ for i, file in enumerate(uploaded_files, start=1):
                 data_type=auto_type,
                 battery_threshold_mv=DEFAULT_BATTERY_LOW_MV,
                 battery_last_n=DEFAULT_BATTERY_LAST_N,
-                battery_low_count_limit=DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
                 stuck_run_threshold=DEFAULT_STUCK_RUN_THRESHOLD,
                 stuck_round_decimals=DEFAULT_STUCK_ROUND_DECIMALS,
             )
+
             issue_df = result_issues_only(health_df)
             row["value_issues_count"] = len(issue_df)
 
+            for _, health_row in health_df.iterrows():
+                summary_health_rows.append({
+                    "file": file.name,
+                    "data_type": auto_type,
+                    "sensor": str(health_row.get("sensor", "")),
+                    "status": health_row.get("status", ""),
+                    "has_issue": bool(health_row.get("has_issue", False)),
+                    "priority": health_row.get("priority", ""),
+                    "recommended_action": health_row.get("recommended_action", ""),
+                })
+
             for _, issue_row in issue_df.iterrows():
+                if auto_type == "Battery":
+                    details = " | ".join([
+                        f"values_checked={issue_row.get('values_checked', '')}",
+                        f"low={issue_row.get('under_threshold_count', '')}",
+                        f"low_pct={issue_row.get('low_percentage', np.nan):.1f}%"
+                        if pd.notna(issue_row.get("low_percentage", np.nan)) else "low_pct=-",
+                        f"max_consecutive_low={issue_row.get('max_consecutive_low', '')}",
+                        f"last_mV={issue_row.get('last_value_mV', np.nan):.0f}"
+                        if pd.notna(issue_row.get("last_value_mV", np.nan)) else "last_mV=-",
+                    ])
+                elif auto_type == "Temperature":
+                    details = " | ".join([
+                        f"values={issue_row.get('values_count', '')}",
+                        f"minus_40_count={issue_row.get('minus_40_count', '')}",
+                        f"max_stuck_run={issue_row.get('max_stuck_run', '')}",
+                        f"stuck_value={issue_row.get('stuck_value', '')}",
+                    ])
+                else:
+                    details = str(issue_row.get("note", ""))
+
                 summary_value_issue_rows.append({
                     "problem_type": "VALUE_ISSUE",
                     "file": file.name,
                     "data_type": auto_type,
-                    "sensor": issue_row.get("sensor", ""),
+                    "sensor": str(issue_row.get("sensor", "")),
                     "issue": issue_row.get("status", ""),
+                    "priority": issue_row.get("priority", ""),
+                    "recommended_action": issue_row.get("recommended_action", ""),
+                    "next_action": issue_row.get("next_action", ""),
+                    "issue_time_range": build_issue_time_range(issue_row, auto_type),
                     "loss_pct": np.nan,
-                    "details": " | ".join([
-                        f"values_checked={issue_row.get('values_checked', issue_row.get('values_count', ''))}",
-                        f"under_threshold_count={issue_row.get('under_threshold_count', '')}",
-                        f"minus_40_count={issue_row.get('minus_40_count', '')}",
-                        f"max_stuck_run={issue_row.get('max_stuck_run', '')}",
-                        f"stuck_value={issue_row.get('stuck_value', '')}",
-                    ]),
+                    "why": issue_row.get("why", ""),
+                    "details": details,
                 })
         else:
             row["value_issues_count"] = np.nan
@@ -1051,8 +1478,14 @@ for i, file in enumerate(uploaded_files, start=1):
     summary_file_rows.append(row)
 
 summary_files_df = pd.DataFrame(summary_file_rows)
+summary_health_df = pd.DataFrame(summary_health_rows)
 summary_value_issues_df = pd.DataFrame(summary_value_issue_rows)
 
+# Packet-loss repair recommendations.
+packet_action_df, packet_system_info = build_packet_problem_actions(
+    packet_problem_df,
+    packet_rep,
+)
 
 # =========================================================
 # 10) Tabs
@@ -1069,50 +1502,105 @@ tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
 # =========================================================
 with tab_summary:
     st.subheader("Summary")
+    st.caption(
+        f"{len(uploaded_files)} CSV file(s) uploaded. "
+        "Battery analysis uses only the last 20 available values per sensor."
+    )
 
     # -----------------------------------------------------
-    # Top-level summary cards
+    # One compact donut: detected problem types
     # -----------------------------------------------------
-    sensors_above_5_count = 0 if packet_problem_df.empty else len(packet_problem_df)
+    problem_type_rows = []
 
-    # Count unique sensor problems across files.
-    # Example: same sensor in two different CSVs is counted separately because
-    # it is a separate file/problem context.
-    if summary_value_issues_df.empty:
-        low_battery_sensor_count = 0
-        value_problem_sensor_count = 0
+    if not packet_problem_df.empty:
+        problem_type_rows.extend(["Packet Loss"] * len(packet_problem_df))
+
+    if not summary_value_issues_df.empty:
+        problem_type_rows.extend(summary_value_issues_df["data_type"].astype(str).tolist())
+
+    st.markdown("### Detected Problems")
+
+    if not problem_type_rows:
+        st.success("✅ No detected problems.")
     else:
-        unique_value_problem_sensors = summary_value_issues_df.drop_duplicates(
-            subset=["file", "data_type", "sensor"]
-        )
-        value_problem_sensor_count = len(unique_value_problem_sensors)
-
-        low_battery_sensor_count = len(
-            summary_value_issues_df[
-                (summary_value_issues_df["data_type"] == "Battery")
-                & (summary_value_issues_df["issue"].astype(str).str.contains("LOW_BATTERY", na=False))
-            ].drop_duplicates(subset=["file", "sensor"])
+        problem_type_counts = (
+            pd.Series(problem_type_rows, name="Problem Type")
+            .value_counts()
+            .rename_axis("Problem Type")
+            .reset_index(name="Count")
         )
 
-    c1, c2, c3, c4 = st.columns(4)
-
-    with c1:
-        st.metric("Uploaded files", len(uploaded_files))
-
-    with c2:
-        if packet_error is not None:
-            st.metric("Sensors > 5% packet loss", "-")
-        else:
-            st.metric("Sensors > 5% packet loss", sensors_above_5_count)
-
-    with c3:
-        st.metric("Low battery sensors", low_battery_sensor_count)
-
-    with c4:
-        st.metric("Sensors with value problem", value_problem_sensor_count)
+        fig_problem_types = go.Figure(
+            data=[go.Pie(
+                labels=problem_type_counts["Problem Type"],
+                values=problem_type_counts["Count"],
+                hole=0.52,
+                textinfo="label+value",
+                hovertemplate="%{label}<br>Count=%{value}<br>%{percent}<extra></extra>",
+            )]
+        )
+        fig_problem_types.update_layout(
+            template="plotly_white",
+            margin=dict(t=10, b=10, l=10, r=10),
+            showlegend=False,
+            height=360,
+        )
+        st.plotly_chart(
+            fig_problem_types,
+            use_container_width=True,
+            key="summary_problem_type_donut",
+        )
 
     # -----------------------------------------------------
-    # Distribution chart
+    # One central table: problem + what to do
+    # -----------------------------------------------------
+    st.markdown("---")
+    st.markdown("### Problems & Recommended Actions")
+
+    if packet_system_info.get("detected", False):
+        st.error(
+            "🔄 **Reset Pi recommended first:** "
+            f"{packet_system_info['affected']} / {packet_system_info['total']} sensors "
+            f"had packet loss above {PACKET_LOSS_ALERT_PCT:.0f}% in the same hour "
+            f"({_fmt_timestamp(packet_system_info['hour'])})."
+        )
+
+    problem_parts = []
+    if not packet_action_df.empty:
+        problem_parts.append(packet_action_df.copy())
+    if not summary_value_issues_df.empty:
+        problem_parts.append(summary_value_issues_df.copy())
+
+    if not problem_parts:
+        st.success("✅ No action is currently required.")
+    else:
+        problems_df = pd.concat(problem_parts, ignore_index=True, sort=False)
+
+        # Keep the main dashboard table intentionally compact.
+        problems_display = problems_df[[
+            "sensor",
+            "data_type",
+            "issue",
+            "recommended_action",
+            "why",
+            "issue_time_range",
+        ]].rename(columns={
+            "sensor": "Sensor",
+            "data_type": "Problem",
+            "issue": "Status / Issue",
+            "recommended_action": "Recommended Action",
+            "why": "Why",
+            "issue_time_range": "Time / Data Range",
+        })
+
+        st.dataframe(
+            problems_display,
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    # -----------------------------------------------------
+    # Packet-loss distribution - keep as requested
     # -----------------------------------------------------
     st.markdown("---")
     st.markdown("### Distribution of Sensor Packet Loss (%)")
@@ -1120,105 +1608,14 @@ with tab_summary:
     if packet_error is not None:
         st.error(f"Could not calculate packet loss from the first CSV: {packet_error}")
     else:
-        st.caption(f"Packet loss is calculated from the first uploaded CSV: **{packet_loss_file.name}**")
+        st.caption(
+            f"Packet loss is calculated from the first uploaded CSV: **{packet_loss_file.name}**"
+        )
         st.plotly_chart(
             plot_sensor_loss_distribution(packet_sensor_loss_df),
             use_container_width=True,
             key="summary_packet_loss_distribution",
         )
-
-    # -----------------------------------------------------
-    # Sensors above 5% packet loss: number + names
-    # -----------------------------------------------------
-    st.markdown("---")
-    st.markdown("### Sensors > 5% Packet Loss")
-
-    if packet_error is not None:
-        st.warning("Packet-loss sensors could not be listed because packet-loss calculation failed.")
-    elif packet_problem_df.empty:
-        st.success("✅ 0 sensors above 5% packet loss.")
-    else:
-        problem_names = packet_problem_df["sensor"].astype(str).tolist()
-
-        st.error(f"🚨 {len(problem_names)} sensor(s) above 5% packet loss.")
-        st.markdown("**Sensor names:**")
-        st.write(", ".join(problem_names))
-
-        packet_summary_display = (
-            packet_problem_df[[
-                "sensor", "loss_pct", "lost_packets", "expected_packets", "packets_received"
-            ]]
-            .sort_values("loss_pct", ascending=False)
-            .rename(columns={
-                "sensor": "Sensor",
-                "loss_pct": "Loss (%)",
-                "lost_packets": "Lost Packets",
-                "expected_packets": "Expected Packets",
-                "packets_received": "Received Packets",
-            })
-        )
-
-        st.dataframe(
-            packet_summary_display.style.format({"Loss (%)": "{:.2f}%"}),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-    # -----------------------------------------------------
-    # Value issue sensors: sensor + issue
-    # -----------------------------------------------------
-    st.markdown("---")
-    st.markdown("### Value Issue Sensors")
-
-    if summary_value_issues_df.empty:
-        st.success("✅ No battery / temperature / light value issues detected.")
-    else:
-        value_issue_display = (
-            summary_value_issues_df[["file", "data_type", "sensor", "issue", "details"]]
-            .rename(columns={
-                "file": "File",
-                "data_type": "Data Type",
-                "sensor": "Sensor",
-                "issue": "Issue",
-                "details": "Details",
-            })
-            .sort_values(["Data Type", "Sensor"])
-        )
-
-        st.error(f"🚨 {len(value_issue_display)} value issue sensor row(s) found.")
-        st.dataframe(value_issue_display, hide_index=True, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Optional combined problem table for quick export / debugging
-    # -----------------------------------------------------
-    with st.expander("Show combined problem table"):
-        problem_rows = []
-
-        if not packet_problem_df.empty:
-            for _, r in packet_problem_df.iterrows():
-                problem_rows.append({
-                    "problem_type": "PACKET_LOSS_>5%",
-                    "file": packet_loss_file.name,
-                    "data_type": "Packet Loss",
-                    "sensor": r["sensor"],
-                    "issue": f"Packet loss above {PACKET_LOSS_ALERT_PCT:.0f}%",
-                    "loss_pct": float(r["loss_pct"]),
-                    "details": f"lost_packets={int(r['lost_packets'])} | expected_packets={int(r['expected_packets'])} | received_packets={int(r['packets_received'])}",
-                })
-
-        if not summary_value_issues_df.empty:
-            problem_rows.extend(summary_value_issues_df.to_dict("records"))
-
-        all_problem_df = pd.DataFrame(problem_rows)
-
-        if all_problem_df.empty:
-            st.success("No problematic sensors found.")
-        else:
-            st.dataframe(
-                all_problem_df.style.format({"loss_pct": "{:.2f}"}),
-                hide_index=True,
-                use_container_width=True,
-            )
 
 
 # =========================================================
@@ -1241,14 +1638,28 @@ with tab_packet_loss:
         else:
             st.error(f"🚨 Attention: {len(high_loss_df)} sensor(s) have overall packet loss above 5%.")
 
-            display_df = high_loss_df[[
-                "sensor", "loss_pct", "lost_packets", "expected_packets", "packets_received",
+            if packet_system_info.get("detected", False):
+                st.warning(
+                    "🔄 Recommended first action: **Reset Pi**. "
+                    f"{packet_system_info['affected']} / {packet_system_info['total']} sensors "
+                    f"crossed the packet-loss threshold in the same hour "
+                    f"({_fmt_timestamp(packet_system_info['hour'])})."
+                )
+
+            display_df = packet_action_df[[
+                "sensor",
+                "loss_pct",
+                "priority",
+                "recommended_action",
+                "next_action",
+                "why",
             ]].rename(columns={
                 "sensor": "Sensor",
                 "loss_pct": "Loss (%)",
-                "lost_packets": "Lost Packets",
-                "expected_packets": "Expected Packets",
-                "packets_received": "Received Packets",
+                "priority": "Priority",
+                "recommended_action": "Recommended Action",
+                "next_action": "If It Persists",
+                "why": "Why",
             })
 
             st.dataframe(
@@ -1321,6 +1732,18 @@ with tab_packet_loss:
             )
 
         st.markdown("---")
+        st.markdown("### Packet Loss Heatmap")
+        st.caption(
+            "Rows are sensors, columns are hours, and each cell shows packet loss (%). "
+            "This helps distinguish a single-sensor problem from a Pi-wide event."
+        )
+        st.plotly_chart(
+            plot_packet_loss_heatmap(packet_rep),
+            use_container_width=True,
+            key="packet_loss_heatmap",
+        )
+
+        st.markdown("---")
         st.markdown("### Distribution of Sensor Packet Loss (%)")
         st.plotly_chart(
             plot_sensor_loss_distribution(packet_sensor_loss_df),
@@ -1347,45 +1770,17 @@ with tab_data_analysis:
         "You can override the detected data type inside each file section."
     )
 
-    st.info(
-        "**How stuck values are checked:** this check is now used only for **Temperature** CSVs. "
-        "For each temperature sensor, the app sorts values by timestamp, rounds each value to "
-        "2 digits after the decimal point by default, and looks for the longest consecutive run "
-        "of the same rounded value. Example: `23.001, 23.004, 23.002, 23.003` becomes "
-        "`23.00, 23.00, 23.00, 23.00`, so it is a stuck run of 4. "
-        "If the run length is equal to or above the threshold, the sensor is flagged. "
-        "Battery does not use stuck-value checks. Light also does not use stuck-value checks."
+    st.caption(
+        "Battery: last 20 values only (<2700 mV = low) • "
+        "Temperature: -40°C + stuck values • Light: no automatic value rule yet"
     )
 
-    with st.expander("Data Analysis Settings", expanded=True):
-        col_b1, col_b2, col_b3 = st.columns(3)
-
-        with col_b1:
-            battery_threshold_mv = st.number_input(
-                "Battery low threshold (mV)",
-                min_value=0,
-                max_value=5000,
-                value=DEFAULT_BATTERY_LOW_MV,
-                step=50,
-            )
-
-        with col_b2:
-            battery_last_n = st.number_input(
-                "Battery: check last N values",
-                min_value=1,
-                max_value=200,
-                value=DEFAULT_BATTERY_LAST_N,
-                step=1,
-            )
-
-        with col_b3:
-            battery_low_count_limit = st.number_input(
-                "Battery: allowed low values",
-                min_value=0,
-                max_value=20,
-                value=DEFAULT_BATTERY_ALLOWED_LOW_COUNT,
-                step=1,
-            )
+    with st.expander("Data Analysis Settings", expanded=False):
+        st.markdown(
+            "**Battery rules are fixed:** last **20** available values per sensor, "
+            f"low battery is **< {DEFAULT_BATTERY_LOW_MV} mV**. "
+            "Current time is not used."
+        )
 
         col_s1, col_s2 = st.columns(2)
 
@@ -1451,14 +1846,20 @@ with tab_data_analysis:
                 result_df = run_data_health_check(
                     raw,
                     data_type=data_type,
-                    battery_threshold_mv=float(battery_threshold_mv),
-                    battery_last_n=int(battery_last_n),
-                    battery_low_count_limit=int(battery_low_count_limit),
+                    battery_threshold_mv=DEFAULT_BATTERY_LOW_MV,
+                    battery_last_n=DEFAULT_BATTERY_LAST_N,
                     stuck_run_threshold=int(stuck_run_threshold),
                     stuck_round_decimals=int(stuck_round_decimals),
                 )
 
                 issue_df = result_issues_only(result_df)
+
+                if not issue_df.empty:
+                    issue_df = issue_df.copy()
+                    issue_df["issue_time_range"] = issue_df.apply(
+                        lambda r: build_issue_time_range(r, data_type),
+                        axis=1,
+                    )
 
                 st.markdown("### Sensor Health Results")
 
@@ -1477,7 +1878,24 @@ with tab_data_analysis:
                     st.success("✅ No data issues detected for this CSV.")
                 else:
                     st.error(f"🚨 {len(issue_df)} sensor(s) have data issues.")
-                    st.dataframe(issue_df, hide_index=True, use_container_width=True)
+
+                    preferred_cols = [
+                        "sensor",
+                        "status",
+                        "recommended_action",
+                        "why",
+                        "issue_time_range",
+                    ]
+
+                    issue_display_cols = [
+                        c for c in preferred_cols if c in issue_df.columns
+                    ]
+
+                    st.dataframe(
+                        issue_df[issue_display_cols],
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
                 with st.expander("Show full health-check table", expanded=issue_df.empty):
                     st.dataframe(result_df, hide_index=True, use_container_width=True)
@@ -1504,14 +1922,14 @@ with tab_data_analysis:
                         wide_for_plot,
                         sensors=plot_sensors,
                         title=f"Last values - {data_type} - {file.name}",
-                        last_n=int(battery_last_n) if data_type == "Battery" else 100,
+                        last_n=DEFAULT_BATTERY_LAST_N if data_type == "Battery" else 100,
                     )
 
                     if data_type == "Battery":
                         fig_last.add_hline(
-                            y=float(battery_threshold_mv),
+                            y=float(DEFAULT_BATTERY_LOW_MV),
                             line_dash="dash",
-                            annotation_text=f"Low threshold: {battery_threshold_mv:.0f} mV",
+                            annotation_text=f"Low threshold: {DEFAULT_BATTERY_LOW_MV:.0f} mV",
                         )
 
                     st.plotly_chart(fig_last, use_container_width=True, key=f"last_values_plot_{file_index}")
