@@ -1,11 +1,12 @@
 import io
+import json
 import os
 import re
-
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # =========================================================
@@ -288,13 +289,60 @@ def normalized_severity(priority: str) -> str:
     return "LOW"
 
 
-def plot_severity_donut(rows_df: pd.DataFrame, title: str) -> go.Figure:
-    """Compact donut chart split into adaptive Low / Medium / High severity."""
+def plot_severity_donut(
+    rows_df: pd.DataFrame,
+    title: str,
+    range_col: str = None,
+    range_label: str = "Problem range",
+    range_decimals: int = 1,
+    range_suffix: str = "",
+) -> go.Figure:
+    """Compact donut chart.
+
+    The donut itself shows category + number of sensors.
+    Hover intentionally does NOT show the slice percentage. Instead it shows:
+    - number of sensors
+    - the actual problem-value range represented by that category
+    """
     order = ["LOW", "MEDIUM", "HIGH"]
-    counts = rows_df["severity"].value_counts() if not rows_df.empty else pd.Series(dtype=int)
-    labels = [level.title() for level in order if int(counts.get(level, 0)) > 0]
-    values = [int(counts.get(level, 0)) for level in order if int(counts.get(level, 0)) > 0]
-    colors = [SEVERITY_COLORS[level] for level in order if int(counts.get(level, 0)) > 0]
+
+    labels = []
+    values = []
+    colors = []
+    range_texts = []
+
+    for level in order:
+        part = rows_df[rows_df["severity"] == level].copy()
+        if part.empty:
+            continue
+
+        labels.append(level.title())
+        values.append(int(len(part)))
+        colors.append(SEVERITY_COLORS[level])
+
+        if range_col and range_col in part.columns:
+            numeric = pd.to_numeric(part[range_col], errors="coerce").dropna()
+            if numeric.empty:
+                range_text = "-"
+            else:
+                lo = float(numeric.min())
+                hi = float(numeric.max())
+
+                if range_decimals == 0:
+                    lo_text = f"{lo:.0f}"
+                    hi_text = f"{hi:.0f}"
+                else:
+                    lo_text = f"{lo:.{range_decimals}f}"
+                    hi_text = f"{hi:.{range_decimals}f}"
+
+                if np.isclose(lo, hi):
+                    range_text = f"{lo_text}{range_suffix}"
+                else:
+                    range_text = f"{lo_text}{range_suffix} – {hi_text}{range_suffix}"
+        else:
+            range_text = "-"
+
+        range_texts.append(range_text)
 
     fig = go.Figure(data=[go.Pie(
         labels=labels,
@@ -302,9 +350,15 @@ def plot_severity_donut(rows_df: pd.DataFrame, title: str) -> go.Figure:
         hole=0.58,
         marker=dict(colors=colors),
         textinfo="label+value",
-        hovertemplate="%{label}<br>Sensors=%{value}<br>%{percent}<extra></extra>",
+        customdata=np.array(range_texts, dtype=object),
+        hovertemplate=(
+            "%{label}<br>"
+            "Sensors=%{value}<br>"
+            + range_label + "=%{customdata}<extra></extra>"
+        ),
         sort=False,
     )])
+
     fig.update_layout(
         template="plotly_white",
         title=dict(text=title, x=0.5, xanchor="center"),
@@ -316,7 +370,11 @@ def plot_severity_donut(rows_df: pd.DataFrame, title: str) -> go.Figure:
 
 
 def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> go.Figure:
-    """Battery donut using the real battery status names."""
+    """Battery donut using the real battery status names.
+
+    Hover shows sensor count + range of low readings in the analyzed last values.
+    It intentionally does not show the slice percentage.
+    """
     order = [
         "LIMITED BATTERY DATA",
         "INSUFFICIENT BATTERY DATA",
@@ -324,11 +382,33 @@ def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> 
         "REPLACE BATTERY",
     ]
 
-    counts = rows_df["issue"].value_counts() if not rows_df.empty else pd.Series(dtype=int)
+    labels = []
+    values = []
+    colors = []
+    ranges = []
 
-    labels = [status for status in order if int(counts.get(status, 0)) > 0]
-    values = [int(counts.get(status, 0)) for status in order if int(counts.get(status, 0)) > 0]
-    colors = [BATTERY_STATUS_COLORS[status] for status in labels]
+    for status in order:
+        part = rows_df[rows_df["issue"] == status].copy()
+        if part.empty:
+            continue
+
+        labels.append(status)
+        values.append(int(len(part)))
+        colors.append(BATTERY_STATUS_COLORS[status])
+
+        if "under_threshold_count" in part.columns:
+            lows = pd.to_numeric(part["under_threshold_count"], errors="coerce").dropna()
+        else:
+            lows = pd.Series(dtype=float)
+
+        if lows.empty:
+            range_text = "-"
+        else:
+            lo = int(lows.min())
+            hi = int(lows.max())
+            range_text = str(lo) if lo == hi else f"{lo} – {hi}"
+
+        ranges.append(range_text)
 
     fig = go.Figure(data=[go.Pie(
         labels=labels,
@@ -336,7 +416,12 @@ def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> 
         hole=0.58,
         marker=dict(colors=colors),
         textinfo="value",
-        hovertemplate="%{label}<br>Sensors=%{value}<br>%{percent}<extra></extra>",
+        customdata=np.array(ranges, dtype=object),
+        hovertemplate=(
+            "%{label}<br>"
+            "Sensors=%{value}<br>"
+            "Low readings range=%{customdata}<extra></extra>"
+        ),
         sort=False,
     )])
 
@@ -1914,6 +1999,10 @@ for i, file in enumerate(uploaded_files, start=1):
                     "next_action": issue_row.get("next_action", ""),
                     "issue_time_range": build_issue_time_range(issue_row, auto_type),
                     "loss_pct": np.nan,
+                    "under_threshold_count": issue_row.get("under_threshold_count", np.nan),
+                    "values_checked": issue_row.get("values_checked", np.nan),
+                    "minus_40_count": issue_row.get("minus_40_count", np.nan),
+                    "minus_40_pct": issue_row.get("minus_40_pct", np.nan),
                     "why": issue_row.get("why", ""),
                     "details": details,
                 })
@@ -1935,13 +2024,532 @@ packet_action_df, packet_system_info = build_packet_problem_actions(
     packet_rep,
 )
 
+
+# =========================================================
+# 9B) Browser-local Maintenance Log
+# =========================================================
+def _primary_action_from_recommendation(recommendation: str) -> str:
+    """Choose the first concrete maintenance action from a recommendation sequence."""
+    value = str(recommendation)
+
+    if value.startswith("Replace Battery") or "Replace Battery →" in value:
+        return "Replace Battery"
+    if value.startswith("Reset Pi") or "Reset Pi →" in value:
+        return "Reset Pi"
+    if value.startswith("Replace Sensor") or "Replace Sensor →" in value:
+        return "Replace Sensor"
+    if value.startswith("Reset Sensor") or "Reset Sensor →" in value:
+        return "Reset Sensor"
+    if value.startswith("Check Battery"):
+        return "Check Battery"
+
+    return "Reset Sensor"
+
+
+def build_maintenance_log_html(
+    experiment_name: str,
+    sensors: list,
+    problem_df: pd.DataFrame,
+) -> str:
+    """Build a self-contained browser-local maintenance log.
+
+    Data is stored in this browser's localStorage under a key specific to the
+    experiment. It is append-only for normal actions; rows can be deleted if
+    entered by mistake.
+    """
+    sensor_list = sorted({str(s) for s in sensors if str(s).strip()})
+
+    recommendations = []
+    if problem_df is not None and not problem_df.empty:
+        for _, row in problem_df.iterrows():
+            recommendation = str(row.get("Recommended Action", ""))
+            recommendations.append({
+                "sensor": str(row.get("Sensor", "")),
+                "problems": str(row.get("Detected Problems", "")),
+                "recommendation": recommendation,
+                "primary_action": _primary_action_from_recommendation(recommendation),
+            })
+
+    payload = {
+        "experiment": str(experiment_name),
+        "sensors": sensor_list,
+        "recommendations": recommendations,
+    }
+
+    payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    storage_key_json = json.dumps(
+        f"field4d_maintenance::{experiment_name}",
+        ensure_ascii=False,
+    )
+
+    return f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+    * {{ box-sizing: border-box; }}
+    body {{
+        margin: 0;
+        background: #0e1117;
+        color: #fafafa;
+        font-family: Arial, Helvetica, sans-serif;
+        font-size: 14px;
+    }}
+    .wrap {{ padding: 4px 4px 20px 4px; }}
+    .card {{
+        border: 1px solid #30343b;
+        background: #151922;
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 14px;
+    }}
+    h3 {{ margin: 0 0 12px 0; font-size: 18px; }}
+    .muted {{ color: #aab2bf; font-size: 12px; }}
+    textarea, select, input {{
+        width: 100%;
+        background: #0e1117;
+        color: #fafafa;
+        border: 1px solid #3a404a;
+        border-radius: 7px;
+        padding: 9px;
+        min-height: 38px;
+    }}
+    textarea {{ min-height: 90px; resize: vertical; }}
+    button {{
+        background: #262c36;
+        color: #fafafa;
+        border: 1px solid #414956;
+        border-radius: 7px;
+        padding: 8px 12px;
+        cursor: pointer;
+    }}
+    button:hover {{ background: #313846; }}
+    .primary {{
+        background: #1f6f43;
+        border-color: #2b8c56;
+    }}
+    .danger {{
+        background: #5c2525;
+        border-color: #8b3434;
+        padding: 5px 8px;
+    }}
+    .grid {{
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr 1fr;
+        gap: 10px;
+    }}
+    .grid2 {{
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+    }}
+    .actions {{
+        display: flex;
+        gap: 8px;
+        margin-top: 10px;
+        flex-wrap: wrap;
+    }}
+    .rec {{
+        border-top: 1px solid #2d323b;
+        padding: 10px 0;
+    }}
+    .rec:first-of-type {{ border-top: none; }}
+    .rec-title {{ font-weight: 700; }}
+    .problem {{ color: #ffbf69; margin: 4px 0; }}
+    table {{
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 10px;
+    }}
+    th, td {{
+        border-bottom: 1px solid #30343b;
+        padding: 8px 6px;
+        text-align: left;
+        vertical-align: top;
+    }}
+    th {{
+        color: #cbd3df;
+        font-size: 12px;
+        position: sticky;
+        top: 0;
+        background: #151922;
+    }}
+    .okmsg {{ color: #73d699; }}
+    .status {{ min-height: 18px; margin-top: 8px; }}
+    @media (max-width: 900px) {{
+        .grid, .grid2 {{ grid-template-columns: 1fr; }}
+    }}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+    <div class="card">
+        <h3>Experiment Notes</h3>
+        <div class="muted">Saved only in this browser for: <b id="expName"></b></div>
+        <textarea id="experimentNotes" placeholder="General notes about the experiment..."></textarea>
+        <div class="actions">
+            <button class="primary" onclick="saveExperimentNotes()">Save Notes</button>
+        </div>
+        <div id="notesStatus" class="status okmsg"></div>
+    </div>
+
+    <div class="card">
+        <h3>Current Recommended Actions</h3>
+        <div class="muted">Press ✓ only after you actually performed the action. The local date/time is recorded automatically and can be edited.</div>
+        <div id="recommendations"></div>
+    </div>
+
+    <div class="card">
+        <h3>Log Maintenance Action</h3>
+        <div class="grid">
+            <div>
+                <div class="muted">Sensor</div>
+                <select id="sensorSelect"></select>
+            </div>
+            <div>
+                <div class="muted">Action</div>
+                <select id="actionSelect">
+                    <option>Reset Pi</option>
+                    <option>Reset Sensor</option>
+                    <option>Replace Battery</option>
+                    <option>Replace Sensor</option>
+                    <option>Check Battery</option>
+                </select>
+            </div>
+            <div>
+                <div class="muted">Date</div>
+                <input type="date" id="actionDate">
+            </div>
+            <div>
+                <div class="muted">Time</div>
+                <input type="time" id="actionTime" step="60">
+            </div>
+        </div>
+
+        <div style="margin-top:10px">
+            <div class="muted">Optional note</div>
+            <textarea id="actionNote" placeholder="What did you do / what did you observe?"></textarea>
+        </div>
+
+        <div class="actions">
+            <button class="primary" onclick="saveManualAction()">✓ Save Action</button>
+        </div>
+        <div id="actionStatus" class="status okmsg"></div>
+    </div>
+
+    <div class="card">
+        <h3>Maintenance History</h3>
+
+        <div class="grid">
+            <div>
+                <div class="muted">Filter Sensor</div>
+                <select id="filterSensor" onchange="renderHistory()"></select>
+            </div>
+            <div>
+                <div class="muted">Filter Action</div>
+                <select id="filterAction" onchange="renderHistory()">
+                    <option value="">All actions</option>
+                    <option>Reset Pi</option>
+                    <option>Reset Sensor</option>
+                    <option>Replace Battery</option>
+                    <option>Replace Sensor</option>
+                    <option>Check Battery</option>
+                </select>
+            </div>
+            <div>
+                <div class="muted">Filter Date</div>
+                <input type="date" id="filterDate" onchange="renderHistory()">
+            </div>
+            <div style="display:flex;align-items:end">
+                <button onclick="exportCSV()">Export CSV</button>
+            </div>
+        </div>
+
+        <div style="overflow:auto; max-height:420px;">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Sensor</th>
+                        <th>Action</th>
+                        <th>Problems at action time</th>
+                        <th>Note</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="historyBody"></tbody>
+            </table>
+        </div>
+    </div>
+
+</div>
+
+<script>
+const APP = {payload_json};
+const STORAGE_KEY = {storage_key_json};
+
+function emptyStore() {{
+    return {{
+        experiment: APP.experiment,
+        notes: "",
+        logs: []
+    }};
+}}
+
+function loadStore() {{
+    try {{
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return emptyStore();
+        const parsed = JSON.parse(raw);
+        if (!parsed.logs) parsed.logs = [];
+        if (parsed.notes === undefined) parsed.notes = "";
+        return parsed;
+    }} catch (e) {{
+        return emptyStore();
+    }}
+}}
+
+function saveStore(store) {{
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+}}
+
+function localNowParts() {{
+    const d = new Date();
+    const pad = n => String(n).padStart(2, "0");
+    return {{
+        date: `${{d.getFullYear()}}-${{pad(d.getMonth()+1)}}-${{pad(d.getDate())}}`,
+        time: `${{pad(d.getHours())}}:${{pad(d.getMinutes())}}`
+    }};
+}}
+
+function setNow() {{
+    const p = localNowParts();
+    document.getElementById("actionDate").value = p.date;
+    document.getElementById("actionTime").value = p.time;
+}}
+
+function escapeHtml(value) {{
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+}}
+
+function sensorOptions(includeAll=false) {{
+    let html = "";
+    if (includeAll) html += '<option value="">All sensors</option>';
+    html += '<option value="Pi/System">Pi/System</option>';
+    for (const s of APP.sensors) {{
+        html += `<option value="${{escapeHtml(s)}}">${{escapeHtml(s)}}</option>`;
+    }}
+    return html;
+}}
+
+function saveExperimentNotes() {{
+    const store = loadStore();
+    store.notes = document.getElementById("experimentNotes").value;
+    saveStore(store);
+    document.getElementById("notesStatus").textContent = "Saved locally.";
+    setTimeout(() => document.getElementById("notesStatus").textContent = "", 1800);
+}}
+
+function appendLog(sensor, action, problems, note, dateValue, timeValue) {{
+    const store = loadStore();
+
+    const date = dateValue || localNowParts().date;
+    const time = timeValue || localNowParts().time;
+
+    store.logs.push({{
+        id: `${{Date.now()}}-${{Math.random().toString(16).slice(2)}}`,
+        experiment: APP.experiment,
+        sensor: sensor,
+        action: action,
+        problems: problems || "",
+        note: note || "",
+        local_datetime: `${{date}} ${{time}}`,
+        date: date,
+        time: time
+    }});
+
+    saveStore(store);
+    renderHistory();
+}}
+
+function saveManualAction() {{
+    const sensor = document.getElementById("sensorSelect").value;
+    const action = document.getElementById("actionSelect").value;
+    const date = document.getElementById("actionDate").value;
+    const time = document.getElementById("actionTime").value;
+    const note = document.getElementById("actionNote").value;
+
+    let problems = "";
+    const rec = APP.recommendations.find(r => r.sensor === sensor);
+    if (rec) problems = rec.problems;
+
+    appendLog(sensor, action, problems, note, date, time);
+
+    document.getElementById("actionNote").value = "";
+    document.getElementById("actionStatus").textContent = "Action saved locally.";
+    setTimeout(() => document.getElementById("actionStatus").textContent = "", 1800);
+    setNow();
+}}
+
+function logRecommended(index) {{
+    const rec = APP.recommendations[index];
+    if (!rec) return;
+
+    const p = localNowParts();
+    const note = prompt("Optional note:", "") ?? "";
+
+    appendLog(
+        rec.sensor,
+        rec.primary_action,
+        rec.problems,
+        note,
+        p.date,
+        p.time
+    );
+}}
+
+function renderRecommendations() {{
+    const root = document.getElementById("recommendations");
+
+    if (!APP.recommendations.length) {{
+        root.innerHTML = '<div class="okmsg">No current recommended actions.</div>';
+        return;
+    }}
+
+    root.innerHTML = APP.recommendations.map((r, i) => `
+        <div class="rec">
+            <div class="rec-title">Sensor ${{escapeHtml(r.sensor)}}</div>
+            <div class="problem">${{escapeHtml(r.problems)}}</div>
+            <div>${{escapeHtml(r.recommendation)}}</div>
+            <div class="actions">
+                <button class="primary" onclick="logRecommended(${{i}})">✓ ${{escapeHtml(r.primary_action)}}</button>
+            </div>
+        </div>
+    `).join("");
+}}
+
+function filteredLogs() {{
+    const store = loadStore();
+    const sensor = document.getElementById("filterSensor").value;
+    const action = document.getElementById("filterAction").value;
+    const date = document.getElementById("filterDate").value;
+
+    return store.logs
+        .filter(r => !sensor || r.sensor === sensor)
+        .filter(r => !action || r.action === action)
+        .filter(r => !date || r.date === date)
+        .sort((a,b) => String(b.local_datetime).localeCompare(String(a.local_datetime)));
+}}
+
+function renderHistory() {{
+    const rows = filteredLogs();
+    const body = document.getElementById("historyBody");
+
+    if (!rows.length) {{
+        body.innerHTML = '<tr><td colspan="6" class="muted">No saved maintenance actions.</td></tr>';
+        return;
+    }}
+
+    body.innerHTML = rows.map(r => `
+        <tr>
+            <td>${{escapeHtml(r.local_datetime)}}</td>
+            <td>${{escapeHtml(r.sensor)}}</td>
+            <td>${{escapeHtml(r.action)}}</td>
+            <td>${{escapeHtml(r.problems)}}</td>
+            <td>${{escapeHtml(r.note)}}</td>
+            <td><button class="danger" onclick="deleteLog('${{r.id}}')">Delete</button></td>
+        </tr>
+    `).join("");
+}}
+
+function deleteLog(id) {{
+    if (!confirm("Delete this entry?")) return;
+    const store = loadStore();
+    store.logs = store.logs.filter(r => r.id !== id);
+    saveStore(store);
+    renderHistory();
+}}
+
+function csvEscape(value) {{
+    const s = String(value ?? "");
+    return '"' + s.replaceAll('"', '""') + '"';
+}}
+
+function exportCSV() {{
+    const store = loadStore();
+    const rows = store.logs
+        .slice()
+        .sort((a,b) => String(a.local_datetime).localeCompare(String(b.local_datetime)));
+
+    const header = [
+        "Experiment", "Time", "Sensor", "Action",
+        "Problems at action time", "Note"
+    ];
+
+    const lines = [header.map(csvEscape).join(",")];
+
+    for (const r of rows) {{
+        lines.push([
+            r.experiment,
+            r.local_datetime,
+            r.sensor,
+            r.action,
+            r.problems,
+            r.note
+        ].map(csvEscape).join(","));
+    }}
+
+    const blob = new Blob(["\\uFEFF" + lines.join("\\n")], {{
+        type: "text/csv;charset=utf-8;"
+    }});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${{APP.experiment}}_maintenance_log.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+}}
+
+function init() {{
+    document.getElementById("expName").textContent = APP.experiment;
+    document.getElementById("sensorSelect").innerHTML = sensorOptions(false);
+    document.getElementById("filterSensor").innerHTML = sensorOptions(true);
+
+    const store = loadStore();
+    document.getElementById("experimentNotes").value = store.notes || "";
+
+    setNow();
+    renderRecommendations();
+    renderHistory();
+}}
+
+init();
+</script>
+</body>
+</html>
+"""
+
+
 # =========================================================
 # 10) Tabs
 # =========================================================
-tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
+experiment_name = infer_experiment_name(uploaded_files)
+unified_problem_df = pd.DataFrame()
+
+tab_summary, tab_packet_loss, tab_data_analysis, tab_maintenance = st.tabs([
     "Summary",
     "Packet Loss Analysis",
     "Data Analysis",
+    "Maintenance Log",
 ])
 
 
@@ -1950,8 +2558,6 @@ tab_summary, tab_packet_loss, tab_data_analysis = st.tabs([
 # =========================================================
 with tab_summary:
     st.subheader("Summary")
-
-    experiment_name = infer_experiment_name(uploaded_files)
 
     all_sensor_names = set()
     if not packet_sensor_loss_df.empty:
@@ -1986,21 +2592,29 @@ with tab_summary:
     # -----------------------------------------------------
     st.markdown("### Problem Severity")
 
-    packet_severity_df = pd.DataFrame(columns=["sensor", "severity"])
+    packet_severity_df = pd.DataFrame(columns=["sensor", "severity", "loss_pct"])
     if not packet_action_df.empty:
-        packet_severity_df = packet_action_df[["sensor", "severity"]].copy()
+        packet_severity_df = packet_action_df[["sensor", "severity", "loss_pct"]].copy()
 
-    battery_status_df = pd.DataFrame(columns=["sensor", "issue", "severity"])
-    temperature_severity_df = pd.DataFrame(columns=["sensor", "severity"])
+    battery_status_df = pd.DataFrame(
+        columns=["sensor", "issue", "severity", "under_threshold_count", "values_checked"]
+    )
+    temperature_severity_df = pd.DataFrame(
+        columns=["sensor", "severity", "minus_40_count", "minus_40_pct"]
+    )
 
     if not summary_value_issues_df.empty:
         battery_status_df = summary_value_issues_df[
             summary_value_issues_df["data_type"] == "Battery"
-        ][["sensor", "issue", "severity"]].copy()
+        ][
+            ["sensor", "issue", "severity", "under_threshold_count", "values_checked"]
+        ].copy()
 
         temperature_severity_df = summary_value_issues_df[
             summary_value_issues_df["data_type"] == "Temperature"
-        ][["sensor", "severity"]].copy()
+        ][
+            ["sensor", "severity", "minus_40_count", "minus_40_pct"]
+        ].copy()
 
     severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
 
@@ -2023,7 +2637,14 @@ with tab_summary:
             st.success("No sensors above 5%")
         else:
             st.plotly_chart(
-                plot_severity_donut(packet_severity_df, "Packet Loss"),
+                plot_severity_donut(
+                    packet_severity_df,
+                    "Packet Loss",
+                    range_col="loss_pct",
+                    range_label="Packet Loss range",
+                    range_decimals=1,
+                    range_suffix="%",
+                ),
                 use_container_width=True,
                 key="summary_packet_loss_severity",
             )
@@ -2041,11 +2662,18 @@ with tab_summary:
 
     with pie3:
         if temperature_severity_df.empty:
-            st.markdown("#### Temperature")
-            st.success("No temperature problems")
+            st.markdown("#### Temperature -40")
+            st.success("No -40 temperature problems")
         else:
             st.plotly_chart(
-                plot_severity_donut(temperature_severity_df, "Temperature"),
+                plot_severity_donut(
+                    temperature_severity_df,
+                    "Temperature -40",
+                    range_col="minus_40_count",
+                    range_label="-40 readings range",
+                    range_decimals=0,
+                    range_suffix="",
+                ),
                 use_container_width=True,
                 key="summary_temperature_severity",
             )
@@ -2053,7 +2681,8 @@ with tab_summary:
     st.caption(
         "Packet Loss and Temperature severity are calculated adaptively from this experiment's own "
         "problem distribution. The only fixed Packet Loss rule is that a sensor must be above 5% "
-        "to be considered a problem. Battery keeps its real decision-tree status names."
+        "to be considered a problem. Hover shows sensor count and the actual problem range, not pie percentages. "
+        "Battery keeps its real decision-tree status names."
     )
 
     # -----------------------------------------------------
@@ -2381,3 +3010,34 @@ with tab_data_analysis:
 
         except Exception as e:
             st.error(f"Error processing {file.name}: {e}")
+
+# =========================================================
+# 10D) Maintenance Log - browser local storage
+# =========================================================
+with tab_maintenance:
+    st.subheader("Maintenance Log")
+    st.caption(
+        "Notes and maintenance actions are stored locally in this browser for this experiment. "
+        "Press ✓ only after performing an action. You can edit the action date/time before saving."
+    )
+
+    maintenance_sensors = set()
+
+    if not packet_sensor_loss_df.empty:
+        maintenance_sensors.update(packet_sensor_loss_df["sensor"].astype(str).tolist())
+
+    if not summary_health_df.empty:
+        maintenance_sensors.update(summary_health_df["sensor"].astype(str).tolist())
+
+    maintenance_html = build_maintenance_log_html(
+        experiment_name=experiment_name,
+        sensors=sorted(maintenance_sensors),
+        problem_df=unified_problem_df,
+    )
+
+    components.html(
+        maintenance_html,
+        height=1050,
+        scrolling=True,
+    )
+
