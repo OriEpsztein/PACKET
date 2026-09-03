@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -372,8 +373,10 @@ def plot_severity_donut(
 def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> go.Figure:
     """Battery donut using the real battery status names.
 
-    Hover shows sensor count + range of low readings in the analyzed last values.
-    It intentionally does not show the slice percentage.
+    Hover is status-aware:
+    - REPLACE / POSSIBLE: show low-value count range from the analyzed values.
+    - LIMITED / INSUFFICIENT: show how many measurements were actually available.
+    Pie-slice percentages are intentionally not shown.
     """
     order = [
         "LIMITED BATTERY DATA",
@@ -385,7 +388,7 @@ def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> 
     labels = []
     values = []
     colors = []
-    ranges = []
+    hover_lines = []
 
     for status in order:
         part = rows_df[rows_df["issue"] == status].copy()
@@ -396,19 +399,51 @@ def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> 
         values.append(int(len(part)))
         colors.append(BATTERY_STATUS_COLORS[status])
 
-        if "under_threshold_count" in part.columns:
-            lows = pd.to_numeric(part["under_threshold_count"], errors="coerce").dropna()
-        else:
-            lows = pd.Series(dtype=float)
+        if status in {"LIMITED BATTERY DATA", "INSUFFICIENT BATTERY DATA"}:
+            available = pd.to_numeric(
+                part.get("values_checked", pd.Series(dtype=float)),
+                errors="coerce",
+            ).dropna()
 
-        if lows.empty:
-            range_text = "-"
-        else:
-            lo = int(lows.min())
-            hi = int(lows.max())
-            range_text = str(lo) if lo == hi else f"{lo} – {hi}"
+            if available.empty:
+                hover_text = "Measurements available=-"
+            else:
+                lo = int(available.min())
+                hi = int(available.max())
+                value_text = str(lo) if lo == hi else f"{lo} – {hi}"
+                hover_text = f"Measurements available={value_text}"
 
-        ranges.append(range_text)
+        else:
+            lows = pd.to_numeric(
+                part.get("under_threshold_count", pd.Series(dtype=float)),
+                errors="coerce",
+            ).dropna()
+
+            checked = pd.to_numeric(
+                part.get("values_checked", pd.Series(dtype=float)),
+                errors="coerce",
+            ).dropna()
+
+            if lows.empty:
+                low_text = "-"
+            else:
+                lo = int(lows.min())
+                hi = int(lows.max())
+                low_text = str(lo) if lo == hi else f"{lo} – {hi}"
+
+            if checked.empty:
+                checked_text = "-"
+            else:
+                clo = int(checked.min())
+                chi = int(checked.max())
+                checked_text = str(clo) if clo == chi else f"{clo} – {chi}"
+
+            hover_text = (
+                f"Low values={low_text}<br>"
+                f"Measurements analyzed={checked_text}"
+            )
+
+        hover_lines.append(hover_text)
 
     fig = go.Figure(data=[go.Pie(
         labels=labels,
@@ -416,11 +451,11 @@ def plot_battery_status_donut(rows_df: pd.DataFrame, title: str = "Battery") -> 
         hole=0.58,
         marker=dict(colors=colors),
         textinfo="value",
-        customdata=np.array(ranges, dtype=object),
+        customdata=np.array(hover_lines, dtype=object),
         hovertemplate=(
             "%{label}<br>"
             "Sensors=%{value}<br>"
-            "Low readings range=%{customdata}<extra></extra>"
+            "%{customdata}<extra></extra>"
         ),
         sort=False,
     )])
@@ -2611,7 +2646,9 @@ with tab_summary:
         ].copy()
 
         temperature_severity_df = summary_value_issues_df[
-            summary_value_issues_df["data_type"] == "Temperature"
+            (summary_value_issues_df["data_type"] == "Temperature")
+            & (summary_value_issues_df["issue"] == "TEMP_-40")
+            & (pd.to_numeric(summary_value_issues_df["minus_40_count"], errors="coerce") > 0)
         ][
             ["sensor", "severity", "minus_40_count", "minus_40_pct"]
         ].copy()
@@ -2670,7 +2707,7 @@ with tab_summary:
                     temperature_severity_df,
                     "Temperature -40",
                     range_col="minus_40_count",
-                    range_label="-40 readings range",
+                    range_label="-40 readings",
                     range_decimals=0,
                     range_suffix="",
                 ),
